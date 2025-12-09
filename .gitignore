@@ -1,0 +1,13 @@
+*.o
+*.ko
+*.mod.c
+.tmp_versions/
+Module.symvers
+modules.builtin
+*.cmd
+.config.old
+vmlinux
+System.map
+arch/*/boot/Image
+arch/*/boot/zImage
+arch/*/boot/bzImage
