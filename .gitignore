@@ -1,13 +1,302 @@
-*.o
+#
+# NOTE! Don't add files that are generated in specific
+# subdirectories here. Add them in the ".gitignore" file
+# in that subdirectory instead.
+#
+# NOTE! Please use 'git ls-files -i --exclude-standard'
+# command after changing this file, to see if there are
+# any tracked files which get ignored after the change.
+#
+# Normal rules (sorted alphabetically)
+#
+.*
+*.a
+*.asn1.[ch]
+*.bin
+*.bz2
+*.c.[012]*.*
+*.dtb
+*.dtb.S
+*.dwo
+*.elf
+*.gcno
+*.gz
+*.i
 *.ko
+*.lex.c
+*.ll
+*.lst
+*.lz4
+*.lzma
+*.lzo
+*.mod
 *.mod.c
-.tmp_versions/
+*.o
+*.o.*
+*.order
+*.patch
+*.s
+*.so
+*.so.dbg
+*.su
+*.symtypes
+*.tab.[ch]
+*.tar
+*.xz
+*.zst
 Module.symvers
 modules.builtin
-*.cmd
+modules.builtin.modinfo
+modules.order
+
+#
+# Top-level generic files
+#
+/tags
+/TAGS
+/linux
+/vmlinux
+/vmlinux.32
+/vmlinux.symvers
+/vmlinuz
+/System.map
+/Module.markers
+/modules.builtin.ranges
+
+#
+# RPM spec file (make rpm)
+#
+/*.spec
+
+#
+# Debian directory (make deb-pkg)
+#
+/debian/
+
+#
+# Snap directory (make snap-pkg)
+#
+/snap/
+
+#
+# tar directory (make tar*-pkg)
+#
+/tar-install/
+
+#
+# We don't want to ignore the following even if they are dot-files
+#
+!.clang-format
+!.cocciconfig
+!.get_maintainer.ignore
+!.gitattributes
+!.gitignore
+!.mailmap
+
+#
+# Generated include files
+#
+/include/config/
+/include/generated/
+/arch/*/include/generated/
+
+# stgit generated dirs
+patches-*
+
+# quilt's files
+patches
+series
+
+# ctags files
+tags
+TAGS
+
+# cscope files
+cscope.*
+ncscope.*
+
+# gnu global files
+GPATH
+GRTAGS
+GSYMS
+GTAGS
+
+# id-utils files
+ID
+
+*.orig
+*~
+\#*#
+
+#
+# Leavings from module signing
+#
+extra_certificates
+signing_key.pem
+signing_key.priv
+signing_key.x509
+x509.genkey
+
+# Kconfig presets
+/all.config
+/alldef.config
+/allmod.config
+/allno.config
+/allrandom.config
+/allyes.config
+
+# Kconfig savedefconfig output
+/defconfig
+
+# Kdevelop4
+*.kdev4
+
+# Clang's compilation database file
+/compile_commands.json
+
+# Documentation toolchain
+/Documentation/output/
+/Documentation/docutils.conf
+/Documentation/.buildinfo
+
+#
+# Build artifacts
+#
+*.tmp
+*.bak
+*.swp
+*.orig
+*.rej
+.*.d
+.*.cmd
+.tmp_*.o
+.tmp_vmlinux*
+.version
+.missing-syscalls.d
+.old_version
+
+#
+# Kernel build artifacts
+#
+/arch/*/boot/dts/**/*.dtb
+/arch/*/boot/dts/**/*.dtbo
+/arch/*/boot/*.dtb
+/arch/*/boot/*.dtbo
+built-in.a
+lib.a
+vmlinux.a
+
+#
+# Compilation byproducts
+#
+*.ko.cmd
+*.mod.cmd
+*.o.cmd
+*.so.cmd
+.*.tmp
+.cache.mk
 .config.old
-vmlinux
-System.map
-arch/*/boot/Image
-arch/*/boot/zImage
-arch/*/boot/bzImage
+.tmp_*
+
+#
+# scripts/ build artifacts
+#
+/scripts/asn1_compiler
+/scripts/basic/fixdep
+/scripts/dtc/dtc
+/scripts/dtc/dtc-lexer.lex.c
+/scripts/dtc/dtc-parser.tab.[ch]
+/scripts/dtc/include-prefixes/
+/scripts/gcc-x86_*-has-stack-protector.sh
+/scripts/genksyms/genksyms
+/scripts/genksyms/lex.lex.c
+/scripts/genksyms/parse.tab.[ch]
+/scripts/kallsyms
+/scripts/kconfig/*conf
+/scripts/kconfig/*conf-cfg
+/scripts/kconfig/.tmp_gtkcheck
+/scripts/kconfig/gconf.glade.h
+/scripts/kconfig/lexer.lex.c
+/scripts/kconfig/parser.tab.[ch]
+/scripts/mod/devicetable-offsets.s
+/scripts/mod/mk_elfconfig
+/scripts/pnmtologo
+/scripts/sign-file
+/scripts/sortextable
+
+#
+# Top-level build files
+#
+.config
+.config.old
+Module.symvers
+modules.builtin
+modules.builtin.modinfo
+modules.order
+
+#
+# Kernel config
+#
+/config_data.gz
+
+#
+# Tools
+#
+/tools/**/built-in.a
+
+#
+# Debian packaging
+#
+/debian
+
+#
+# tar packaging
+#
+/tar-install
+
+#
+# certs
+#
+/certs/signing_key.pem
+/certs/signing_key.x509
+/certs/x509.genkey
+
+#
+# usr/ build artifacts  
+#
+/usr/initramfs_data.cpio*
+/usr/gen_init_cpio
+
+#
+# lib/ build artifacts
+#
+/lib/crc32table.h
+/lib/crc64table.h
+/lib/gen_crc32table
+/lib/gen_crc64table
+
+#
+# Security
+#
+/security/selinux/av_permissions.h
+/security/selinux/flask.h
+
+#
+# Kdump
+#
+/vmcoreinfo
+
+#
+# Test fortify
+#
+/lib/test_fortify/*.log
+
+#
+# Build outputs
+#
+/arch/*/boot/Image
+/arch/*/boot/Image.gz
+/arch/*/boot/zImage
+/arch/*/boot/bzImage
+/arch/*/boot/compressed/vmlinux
+/arch/*/boot/compressed/vmlinux.bin
