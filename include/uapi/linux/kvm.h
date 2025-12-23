@@ -1221,6 +1221,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_CAP_ARM_SUPPORTED_REG_MASK_RANGES 230
 
 #define KVM_CAP_ARM_WRITABLE_IMP_ID_REGS 239
+#define KVM_CAP_ARM_DSM 240
 
 #define KVM_CAP_ARM_RME 300
 
@@ -1239,6 +1240,39 @@ struct kvm_ppc_resize_hpt {
 #define KVM_CAP_ARM_VIRT_MSI_BYPASS 799
 
 #ifdef KVM_CAP_IRQ_ROUTING
+
+
+
+/* ioctl for DSM */
+struct kvm_dsm_params {
+	__u32 dsm_id;
+	__u32 cluster_iplist_len;
+	void __user *cluster_iplist;
+};
+#define KVM_DSM_ENABLE            _IOW(KVMIO,  0xf0, struct kvm_dsm_params)
+
+/* DSM memcpy in qemu should be redirected to KVM to keep DSM page privilege consistent. */
+struct kvm_dsm_memcpy {
+	bool write;
+	__u64 host_virt_addr;
+	__u64 userspace_addr;
+	__u64 length;
+};
+#define KVM_DSM_MEMCPY            _IOW(KVMIO,  0xf1, struct kvm_dsm_memcpy)
+
+/* DSM memory mapping in qemu should result in pinning the mapped pages in KVM DSM */
+struct kvm_dsm_mempin {
+	bool write;
+	bool unpin;
+	__u64 host_virt_addr;
+	__u64 length;
+};
+#define KVM_DSM_MEMPIN            _IOW(KVMIO,  0xf2, struct kvm_dsm_mempin)
+
+#define KVM_DSM_PGSIZE            (4 * 1024)
+
+
+
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;

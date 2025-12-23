@@ -446,6 +446,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_PTP_KVM:
 	case KVM_CAP_ARM_WRITABLE_IMP_ID_REGS:
 	case KVM_CAP_ARM_SYSTEM_SUSPEND:
+#ifdef CONFIG_KVM_DSM
+	case KVM_CAP_ARM_DSM:
+#endif
 	case KVM_CAP_IRQFD_RESAMPLE:
 		r = 1;
 		break;

@@ -50,6 +50,33 @@ menuconfig KVM
 
 	  If unsure, say N.
 
+config KVM_DSM_TCP
+	bool "KVM distributed software memory support on TCP"
+	depends on KVM 
+	default n
+	select KVM_DSM
+	help
+	  Provide support for distributed software memory (over TCP) inside KVM,
+	  which allows userspace to implement distributed hypervisors.
+
+config KVM_DSM_RDMA
+	bool "KVM distributed software memory support on RDMA"
+	depends on KVM && INFINIBAND_ADDR_TRANS
+	default n
+	select KVM_DSM
+	help
+	  Provide support for distributed software memory (over RDMA) inside KVM,
+	  which allows userspace to implement distributed hypervisors.
+
+config KVM_DSM
+	bool "KVM distributed software memory support"
+	depends on KVM 
+	depends on KVM_DSM_TCP || KVM_DSM_RDMA
+	default n
+	help
+	  Provide support for distributed software memory inside KVM, which allows
+	  userspace to implement distributed hypervisors.
+
 config HISI_VIRTCCA_HOST
 	bool "Enable virtcca cvm host feature"
 	depends on KVM

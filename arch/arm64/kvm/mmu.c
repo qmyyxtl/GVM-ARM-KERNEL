@@ -23,6 +23,7 @@
 #include <asm/kvm_tmi.h>
 #endif
 #include "trace.h"
+#include "dsm.h"
 
 static struct kvm_pgtable *hyp_pgtable;
 static DEFINE_MUTEX(kvm_hyp_pgd_mutex);
@@ -2415,3 +2416,75 @@ int kvm_mmu_mark_touched_log(struct kvm *kvm)
 
 	return 0;
 }
+
+#ifdef CONFIG_KVM_DSM
+
+
+
+
+
+
+/*
+ * Return gfns mapped to given vfn.
+ * @backup: Which rmap should be used.
+ * @is_smm: Whether returned gfn is in SMM mode. It can be NULL.
+ * @iter_idx: Iteration index. If it's NULL, this function return the first
+ * (should better be treated as a random one) gfn.
+ * If you want to traverse the whole gfn list, you can use the following code:
+ * int iter_idx = 0;
+ * while (iter_idx >= 0) {
+ *     gfn = __kvm_dsm_vfn_to_gfn(slot, vfn, NULL, &iter_idx);
+ *     // do something with gfn
+ * }
+ * @return ~0 on not found
+ */
+gfn_t __kvm_dsm_vfn_to_gfn(struct kvm_dsm_memory_slot *slot, hfn_t vfn, struct kvm_memory_slot *memslot)
+{
+
+	if (memslot == NULL)
+		return vfn - slot->base_vfn+slot->base_gfn;
+	return vfn - slot->base_vfn+memslot->base_gfn;
+}
+
+
+void kvm_dsm_apply_access_right(struct kvm *kvm,
+		struct kvm_dsm_memory_slot *slot, hfn_t vfn, unsigned long dsm_access, struct kvm_memory_slot *memslot)
+{
+	u64 *entry;
+	gfn_t gfn = __kvm_dsm_vfn_to_gfn(slot,vfn,memslot);
+	u64 ipa = (u64)gfn << PAGE_SHIFT;
+	bool flush = false;
+
+	dsm_debug_v("kvm[%d] set vfn[%llu] to dsm_access[%lu]", kvm->arch.dsm_id,
+			vfn, dsm_access);
+	/*
+	 * This should rarely race since we almost always do the memslot
+	 * manipulation at the initialization stage and never modify them
+	 * afterwards. The most likely cause of race would be concurrent accesses
+	 * to a dual-port MMIO device.
+	 */
+	write_lock(&kvm->mmu_lock);
+
+	switch (dsm_access) {
+        case DSM_INVALID:
+        case DSM_MODIFIED:
+            flush = (kvm_pgtable_stage2_unmap(kvm->arch.mmu.pgt, ipa, PAGE_SIZE) > 0);
+            break;
+            
+        case DSM_SHARED:
+            flush = (kvm_pgtable_stage2_wrprotect(kvm->arch.mmu.pgt, ipa, PAGE_SIZE) == 0);
+            break;
+            
+        default:
+            break;
+    }
+    
+	if (flush)
+		kvm_flush_remote_tlbs(kvm);
+	write_unlock(&kvm->mmu_lock);
+}
+
+
+
+
+#endif

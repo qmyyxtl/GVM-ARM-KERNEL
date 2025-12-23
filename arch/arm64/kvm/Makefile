@@ -28,6 +28,9 @@ kvm-$(CONFIG_HW_PERF_EVENTS)  += pmu-emul.o pmu.o
 kvm-$(CONFIG_HISI_VIRTCCA_HOST) += tmi.o
 kvm-$(CONFIG_HISI_VIRTCCA_HOST) += virtcca_cvm.o
 kvm-$(CONFIG_HISI_VIRTCCA_HOST) += virtcca_cvm_exit.o
+kvm-$(CONFIG_KVM_DSM)	+= xbzrle.o dsm.o dsm-util.o ivy.o dsm_arm64.o
+kvm-$(CONFIG_KVM_DSM_TCP) += ktcp.o
+kvm-$(CONFIG_KVM_DSM_RDMA) += krdma.o
 obj-$(CONFIG_KVM_HISI_VIRT) += hisilicon/
 
 always-y := hyp_constants.h hyp-constants.s

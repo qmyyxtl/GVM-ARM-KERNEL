@@ -62,6 +62,9 @@
 
 #define KVM_HAVE_MMU_RWLOCK
 
+#define KVM_MEM_SLOTS_NUM SHRT_MAX
+#define KVM_USER_MEM_SLOTS (KVM_MEM_SLOTS_NUM - KVM_INTERNAL_MEM_SLOTS)
+
 /*
  * Mode of operation configurable with kvm-arm.mode early param.
  * See Documentation/admin-guide/kernel-parameters.txt for more information.
@@ -207,6 +210,131 @@ struct kvm_protected_vm {
 	struct kvm_hyp_memcache teardown_mc;
 };
 
+
+
+#ifdef CONFIG_KVM_DSM
+// #define KVM_DSMPF_DEBUG
+// #define KVM_DSM_DEBUG
+
+/* TODO: Make TCP interfaces compatible. */
+#define USE_KTCP_NETWORK
+// #define USE_KRDMA_NETWORK
+
+#define IVY_KVM_DSM
+// #define TARDIS_KVM_DSM
+
+#ifdef KVM_DSM_DEBUG
+extern bool kvm_dsm_dbg_verbose;
+#endif
+
+#ifdef USE_KTCP_NETWORK
+	#include "../kvm/ktcp.h"
+	typedef struct ktcp_cb kconnection_t;
+#endif
+
+#ifdef USE_KRDMA_NETWORK
+	#include "../kvm/krdma.h"
+	typedef struct krdma_cb kconnection_t;
+#endif
+
+/*
+ * copyset is actually uint16_t. Hacking here is used for compatibility with
+ * bitmap ops in linux kernel.
+ */
+typedef unsigned long copyset_t;
+
+/*
+ * uint32_t may wraparound and potientally ruin everything.
+ * FIXME!
+ */
+typedef uint32_t version_t;
+typedef uint32_t timestamp_t;
+
+#define KVM_DSM_W_SHARED
+// #define KVM_DSM_DIFF
+#define KVM_DSM_PF_PROFILE
+
+#define DSM_MAX_INSTANCES 16
+
+/*
+ * Besides data, each transation is binded with an addtional data structure.
+ */
+typedef struct tx_add {
+#ifdef IVY_KVM_DSM
+	/* Nodes indicated by inv_copyset should be sent INV messages upon write
+	 * fault. It's also used to transfer the complete copyset upon read fault. */
+	uint16_t inv_copyset;
+	/* Pages with different versions MAY have different data. */
+	uint16_t version;
+#elif defined(TARDIS_KVM_DSM)
+	uint32_t wts;
+	uint32_t rts;
+	uint8_t owner;
+	bool aborted;
+#endif
+	/*
+	 * (Hopefully) unique transcation id, which is used to eliminate the
+	 * necessity of per-socket locks.
+	 */
+	uint16_t txid;
+} tx_add_t;
+
+struct kvm_dsm_info {
+#ifdef IVY_KVM_DSM
+	unsigned state;
+	DECLARE_BITMAP(copyset, DSM_MAX_INSTANCES);
+	struct mutex fast_path_lock;
+	atomic_t fast_path_locked;
+#endif
+	atomic_t pinned_read;
+	atomic_t pinned_write;
+	struct mutex lock;
+#ifdef KVM_DSM_PF_PROFILE
+	atomic_t read_pf;
+	atomic_t write_pf;
+#endif
+
+#ifdef KVM_DSM_DIFF
+	struct {
+		char *twin;
+		version_t version;
+		/* This copyset holds the nodes where data is the same as twin. */
+		DECLARE_BITMAP(copyset, DSM_MAX_INSTANCES);
+	} diff;
+#endif
+
+#ifdef IVY_KVM_DSM
+	version_t version;
+#elif defined(TARDIS_KVM_DSM)
+	/* TODO: initalize atomic variable rather than setting it to zero simply */
+	atomic64_t state;
+#endif
+};
+
+struct kvm_dsm_memory_slot {
+	hfn_t base_vfn;
+	// only one kvm memslot is allowed to be associated with a dsm_memslot
+	gfn_t base_gfn;
+	unsigned long npages;
+	/*
+	 * gfn->vfn mapping exists in memslot. However, memslot can be modified on
+	 * the initialization period many times. Specifcally, create & delete memory
+	 * region by QEMU. backup_rmap records previous rmap when memslot is
+	 * deleted and get deleted when memslot is added. Its main attempt is to
+	 * find old vfn when new added memslot changes gfn->vfn mapping. We need to
+	 * copy old dsm state to new one to keep consistency.
+	 */
+	struct kvm_dsm_info *vfn_dsm_state;
+
+};
+
+struct kvm_dsm_memslots {
+	struct kvm_dsm_memory_slot memslots[KVM_MEM_SLOTS_NUM];
+	atomic_t lru_slot;
+	int used_slots;
+};
+#endif /* CONFIG_KVM_DSM */
+
 struct kvm_arch {
 	struct kvm_s2_mmu mmu;
 
@@ -299,6 +427,33 @@ struct kvm_arch {
 	 * the associated pKVM instance in the hypervisor.
 	 */
 	struct kvm_protected_vm pkvm;
+
+#ifdef CONFIG_KVM_DSM
+	bool dsm_enabled;
+	int dsm_id;
+	struct kvm_dsm_memslots *dsm_hvaslots;
+	struct mutex dsm_lock;
+
+	struct mutex conn_init_lock;
+
+	struct task_struct *dsm_thread;
+	kconnection_t **dsm_conn_socks;
+	bool dsm_stopped;
+
+	u32 cluster_iplist_len;
+	char **cluster_iplist;
+
+#ifdef TARDIS_KVM_DSM
+	struct timer_list expiration_timer;
+	struct task_struct *expiration_timer_thread;
+	struct completion expiration_alarm_clock;
+	struct srcu_struct expiration_list_srcu;
+	spinlock_t expiration_list_writer_lock;
+	struct list_head expiration_list;
+	atomic_t pts;
+#endif /* TARDIS_KVM_DSM */
+
+#endif /* CONFIG_KVM_DSM */
 
 #ifdef CONFIG_KVM_HISI_VIRT
 	spinlock_t sched_lock;
@@ -992,6 +1147,11 @@ static inline bool __vcpu_write_sys_reg_to_cpu(u64 val, int reg)
 
 struct kvm_vm_stat {
 	struct kvm_vm_stat_generic generic;
+	#if defined(CONFIG_KVM_DSM) & defined(KVM_DSM_PF_PROFILE)
+	ulong total_dsm_pfs;
+	ulong total_tx_bytes;
+	ulong total_tx_latency; /* in us */
+	#endif
 };
 
 struct kvm_vcpu_stat {
