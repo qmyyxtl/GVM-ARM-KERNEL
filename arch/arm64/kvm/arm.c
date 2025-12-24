@@ -46,6 +46,7 @@
 #include <kvm/arm_hypercalls.h>
 #include <kvm/arm_pmu.h>
 #include <kvm/arm_psci.h>
+#include "dsm.h"
 
 static enum kvm_mode kvm_mode = KVM_MODE_DEFAULT;
 
@@ -339,6 +340,12 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 		return -EINVAL;
 	}
 
+#ifdef CONFIG_KVM_DSM
+	ret = kvm_dsm_alloc(kvm);
+	if (ret < 0)
+		return ret;
+#endif
+
 	ret = kvm_share_hyp(kvm, kvm + 1);
 	if (ret)
 		return ret;
@@ -410,6 +417,9 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
 		pkvm_destroy_hyp_vm(kvm);
 
 	kvm_destroy_vcpus(kvm);
+#ifdef CONFIG_KVM_DSM
+	kvm_dsm_free(kvm);
+#endif
 
 	kvm_unshare_hyp(kvm, kvm + 1);
 
@@ -2137,7 +2147,7 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		return kvm_vm_ioctl_get_reg_writable_masks(kvm, &range);
 	}
 	default:
-		return -EINVAL;
+		return kvm_vm_ioctl_dsm(kvm, ioctl, arg);
 	}
 }
 

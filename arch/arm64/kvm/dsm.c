@@ -541,10 +541,8 @@ out_listen_sock:
 }
 
 static int kvm_dsm_init(struct kvm *kvm, struct kvm_dsm_params *params)
-// without qemu test
-// int kvm_dsm_init(struct kvm *kvm, struct kvm_dsm_params *params)
 {
-	// printk("kvm_dsm_init");/
+	printk("kvm_dsm_init");
 	int ret = 0;
 	struct task_struct *thread;
 	int i;
@@ -623,7 +621,6 @@ static int kvm_dsm_init(struct kvm *kvm, struct kvm_dsm_params *params)
 	kvm->arch.dsm_id = params->dsm_id;
 	thread = kthread_run(kvm_dsm_threadfn, (void*)kvm, "kvm-dsm/%d",
 			kvm->arch.dsm_id);
-// printk("kvm_dsm_init 628, %d\n",ret);
 	if (IS_ERR(thread)) {
 
 		printk(KERN_ERR "kvm-dsm: failed to start kernel thread for dsm server\n");
@@ -631,20 +628,17 @@ static int kvm_dsm_init(struct kvm *kvm, struct kvm_dsm_params *params)
 		goto out;
 	}
 	kvm->arch.dsm_thread = thread;
-// printk("kvm_dsm_init 634, %d\n",ret);
 	return ret;
 
 out:
 	kfree(kvm->arch.dsm_conn_socks);
 	kvm->arch.dsm_enabled = false;
-// printk("kvm_dsm_init 640, %d\n",ret);
 	return ret;
 out_free_cluster_iplist:
 	for (i = 0; i < params->cluster_iplist_len; i++)
 		kfree(kvm->arch.cluster_iplist[i]);
 	kfree(kvm->arch.cluster_iplist);
 	kfree(user_cluster_iplist);
-// printk("kvm_dsm_init 647\n");
 	return ret;
 }
 
@@ -710,7 +704,6 @@ static int kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		gfn_t gfn, bool is_smm, int write)
 {
 	int ret;
-	// printk("kvm_dsm_page_fault");
 #ifdef KVM_DSM_PF_PROFILE
 	struct timespec64 ts;
 	ulong start;
@@ -720,11 +713,7 @@ static int kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 #endif
 
 #ifdef IVY_KVM_DSM
-	// struct kvm_dsm_memory_slot *slot;
-	// slot = gfn_to_hvaslot(kvm, memslot, gfn);
 	ret = ivy_kvm_dsm_page_fault(kvm, memslot, gfn, is_smm, write);
-	// printk("ivy_page_fault_handle: gfn %llx , dsm_access %d,dsm_memslot_base_vfn %llx,memslot_base_gfn %llx\n"
-		// ,gfn,ret,slot->base_vfn,memslot->base_gfn);
 #elif defined(TARDIS_KVM_DSM)
 	ret = tardis_kvm_dsm_page_fault(kvm, memslot, gfn, is_smm, write);
 #endif
@@ -744,7 +733,6 @@ int kvm_dsm_memcpy(struct kvm *kvm, unsigned long host_virt_addr,
 	struct kvm_memory_slot *memslot;
 	hfn_t vfn, vfn_end;
 	gfn_t gfn;
-	bool is_smm;
 	unsigned long npages, gfn_npages, i, j;
 	unsigned long hva_start, hva_end, l;
 	void *user_buf;
@@ -775,11 +763,11 @@ int kvm_dsm_memcpy(struct kvm *kvm, unsigned long host_virt_addr,
 
 		for (i = 0; i < npages; i += gfn_npages) {
 			gfn = __kvm_dsm_vfn_to_gfn(slot, vfn + i, NULL);
-			memslot = __gfn_to_memslot(__kvm_memslots(kvm, is_smm), gfn);
+			memslot = __gfn_to_memslot(__kvm_memslots(kvm, 0), gfn);
 			gfn_npages = min(npages - i, (unsigned long)(memslot->base_gfn +
 						memslot->npages - gfn));
 			for (j = 0; j < gfn_npages; j++) {
-				ret = kvm_dsm_page_fault(kvm, memslot, gfn + j, is_smm, write);
+				ret = kvm_dsm_page_fault(kvm, memslot, gfn + j, 0, write);
 				if (ret < 0)
 					goto out_unlock;
 			}
@@ -827,7 +815,6 @@ int kvm_dsm_mempin(struct kvm *kvm, unsigned long host_virt_addr,
 	struct kvm_memory_slot *memslot;
 	hfn_t vfn, vfn_end;
 	gfn_t gfn;
-	bool is_smm;
 	unsigned long npages, gfn_npages, i, j;
 	int idx, ret = 0;
 
@@ -863,11 +850,11 @@ int kvm_dsm_mempin(struct kvm *kvm, unsigned long host_virt_addr,
 
 		for (i = 0; i < npages; i += gfn_npages) {
 			gfn = __kvm_dsm_vfn_to_gfn(slot, vfn + i,NULL);
-			memslot = __gfn_to_memslot(__kvm_memslots(kvm, is_smm), gfn);
+			memslot = __gfn_to_memslot(__kvm_memslots(kvm, 0), gfn);
 			gfn_npages = min(npages - i, (unsigned long)(memslot->base_gfn +
 						memslot->npages - gfn));
 			for (j = 0; j < gfn_npages; j++) {
-				ret = kvm_dsm_page_fault(kvm, memslot, gfn + j, is_smm, write);
+				ret = kvm_dsm_page_fault(kvm, memslot, gfn + j, 0, write);
 				if (ret < 0)
 					goto out_unlock;
 			}
@@ -915,7 +902,6 @@ long kvm_vm_ioctl_dsm(struct kvm *kvm, unsigned ioctl,
 		 *     goto out;
 		 */
 		r = kvm_dsm_init(kvm, &params);
-		// printk("kvm_vm_ioctl_dsm 914, %d\n",r);
 		if (r)
 			goto out;
 		break;

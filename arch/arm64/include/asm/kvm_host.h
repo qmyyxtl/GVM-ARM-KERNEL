@@ -214,7 +214,7 @@ struct kvm_protected_vm {
 
 #ifdef CONFIG_KVM_DSM
 // #define KVM_DSMPF_DEBUG
-// #define KVM_DSM_DEBUG
+#define KVM_DSM_DEBUG
 
 /* TODO: Make TCP interfaces compatible. */
 #define USE_KTCP_NETWORK

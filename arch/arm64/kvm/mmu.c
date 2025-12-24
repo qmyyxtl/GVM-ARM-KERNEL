@@ -1858,7 +1858,7 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 		 * faulting VA. This is always 12 bits, irrespective
 		 * of the page size.
 		 */
-		fault_ipa |= kvm_vcpu_get_hfar(vcpu) & ((1 << 12) - 1);
+		fault_ipa |= kvm_vcpu_get_hfar(vcpu) & GENMASK(11, 0);
 		ret = io_mem_abort(vcpu, kvm_gpa_from_fault(vcpu->kvm, fault_ipa));
 		goto out_unlock;
 	}
