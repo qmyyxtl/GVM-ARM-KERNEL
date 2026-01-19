@@ -1484,6 +1484,8 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 
 	fault_granule = 1UL << ARM64_HW_PGTABLE_LEVEL_SHIFT(fault_level);
 	write_fault = kvm_is_write_fault(vcpu);
+	int dsm_access = kvm_dsm_vcpu_acquire_page(vcpu,&memslot,gfn,write_fault);
+	
 
 	/*
 	 * Realms cannot map protected pages read-only

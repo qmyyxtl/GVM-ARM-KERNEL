@@ -167,6 +167,7 @@ int kvm_handle_mmio_return(struct kvm_vcpu *vcpu)
 
 int io_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
 {
+	printk("KVM: IO mem abort at IPA 0x%llx\n", fault_ipa);
 	struct kvm_run *run = vcpu->run;
 	unsigned long data;
 	unsigned long rt;
