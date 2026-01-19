@@ -271,6 +271,17 @@ int kvm_smccc_call_handler(struct kvm_vcpu *vcpu)
 	u8 action;
 	gpa_t gpa;
 
+
+	if (func_id == ARM_SMCCC_HV_PV_DEMO_GET) {
+		printk("KVM: Direct handling PV_DEMO_GET\n");
+		gpa = kvm_init_demo_data(vcpu);
+		printk("KVM: kvm_init_demo_data returned 0x%llx\n", gpa);
+		if (gpa != INVALID_GPA)
+			val[0] = gpa;
+		else
+			printk("KVM: demo.base is INVALID_GPA!\n");
+		goto out;
+	}
 	action = kvm_smccc_get_action(vcpu, func_id);
 	switch (action) {
 	case KVM_SMCCC_FILTER_HANDLE:
@@ -343,6 +354,9 @@ int kvm_smccc_call_handler(struct kvm_vcpu *vcpu)
 			if (test_bit(KVM_REG_ARM_STD_HYP_BIT_PV_TIME,
 				     &smccc_feat->std_hyp_bmap))
 				val[0] = SMCCC_RET_SUCCESS;
+			break;
+		case ARM_SMCCC_HV_PV_DEMO_GET:
+			val[0] = SMCCC_RET_SUCCESS;
 			break;
 #ifdef CONFIG_PARAVIRT_SCHED
 		case ARM_SMCCC_HV_PV_SCHED_FEATURES:

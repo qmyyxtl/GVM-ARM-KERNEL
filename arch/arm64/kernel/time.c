@@ -31,6 +31,7 @@
 
 #include <asm/thread_info.h>
 #include <asm/paravirt.h>
+#include <asm/paravirt-demo.h>
 
 static bool profile_pc_cb(void *arg, unsigned long pc)
 {
@@ -69,4 +70,5 @@ void __init time_init(void)
 	lpj_fine = arch_timer_rate / HZ;
 
 	pv_time_init();
+	pv_demo_init(); 
 }

@@ -658,6 +658,10 @@ struct kvm_vcpu_arch {
 		u64 last_steal;
 		gpa_t base;
 	} steal;
+	
+	struct {
+		gpa_t base;
+	} demo;
 
 #ifdef CONFIG_PARAVIRT_SCHED
 	/* Guest PV sched state */
@@ -1130,6 +1134,16 @@ static inline bool kvm_arch_pmi_in_guest(struct kvm_vcpu *vcpu)
 }
 
 long kvm_hypercall_pv_features(struct kvm_vcpu *vcpu);
+
+/* PV Demo */
+gpa_t kvm_init_demo_data(struct kvm_vcpu *vcpu);
+int kvm_arm_pvdemo_set_attr(struct kvm_vcpu *vcpu,
+			    struct kvm_device_attr *attr);
+int kvm_arm_pvdemo_get_attr(struct kvm_vcpu *vcpu,
+			    struct kvm_device_attr *attr);
+int kvm_arm_pvdemo_has_attr(struct kvm_vcpu *vcpu,
+			    struct kvm_device_attr *attr);
+
 gpa_t kvm_init_stolen_time(struct kvm_vcpu *vcpu);
 void kvm_update_stolen_time(struct kvm_vcpu *vcpu);
 
@@ -1152,6 +1166,7 @@ void kvm_arm_pinned_vmid_put(struct kvm_vmid *kvm_vmid);
 static inline void kvm_arm_pvtime_vcpu_init(struct kvm_vcpu_arch *vcpu_arch)
 {
 	vcpu_arch->steal.base = INVALID_GPA;
+	vcpu_arch->demo.base = INVALID_GPA;
 }
 
 static inline bool kvm_arm_is_pvtime_enabled(struct kvm_vcpu_arch *vcpu_arch)

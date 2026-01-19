@@ -1081,6 +1081,9 @@ int kvm_arm_vcpu_arch_set_attr(struct kvm_vcpu *vcpu,
 	case KVM_ARM_VCPU_PVTIME_CTRL:
 		ret = kvm_arm_pvtime_set_attr(vcpu, attr);
 		break;
+	case KVM_ARM_VCPU_PVDEMO_CTRL:
+		ret = kvm_arm_pvdemo_set_attr(vcpu, attr);
+		break;
 	default:
 		ret = -ENXIO;
 		break;
