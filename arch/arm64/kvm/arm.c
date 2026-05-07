@@ -46,7 +46,9 @@
 #include <kvm/arm_hypercalls.h>
 #include <kvm/arm_pmu.h>
 #include <kvm/arm_psci.h>
+#ifdef CONFIG_KVM_DSM
 #include "dsm.h"
+#endif
 
 static enum kvm_mode kvm_mode = KVM_MODE_DEFAULT;
 
@@ -2147,7 +2149,10 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		return kvm_vm_ioctl_get_reg_writable_masks(kvm, &range);
 	}
 	default:
+#ifdef CONFIG_KVM_DSM
 		return kvm_vm_ioctl_dsm(kvm, ioctl, arg);
+#endif
+		return -EINVAL;
 	}
 }
 

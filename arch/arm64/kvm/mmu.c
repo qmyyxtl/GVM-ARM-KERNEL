@@ -23,7 +23,10 @@
 #include <asm/kvm_tmi.h>
 #endif
 #include "trace.h"
+
+#ifdef CONFIG_KVM_DSM
 #include "dsm.h"
+#endif
 
 static struct kvm_pgtable *hyp_pgtable;
 static DEFINE_MUTEX(kvm_hyp_pgd_mutex);
@@ -1484,7 +1487,9 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 
 	fault_granule = 1UL << ARM64_HW_PGTABLE_LEVEL_SHIFT(fault_level);
 	write_fault = kvm_is_write_fault(vcpu);
+#ifdef CONFIG_KVM_DSM
 	int dsm_access = kvm_dsm_vcpu_acquire_page(vcpu,&memslot,gfn,write_fault);
+#endif 
 	
 
 	/*
