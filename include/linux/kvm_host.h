@@ -259,17 +259,17 @@ union kvm_mmu_notifier_arg {
 	pte_t pte;
 };
 
-enum kvm_gfn_range_filter {
-	KVM_FILTER_SHARED		= BIT(0),
-	KVM_FILTER_PRIVATE		= BIT(1),
-};
+// enum kvm_gfn_range_filter {
+// 	KVM_FILTER_SHARED		= BIT(0),
+// 	KVM_FILTER_PRIVATE		= BIT(1),
+// };
 
 struct kvm_gfn_range {
 	struct kvm_memory_slot *slot;
 	gfn_t start;
 	gfn_t end;
 	union kvm_mmu_notifier_arg arg;
-	enum kvm_gfn_range_filter attr_filter;
+	// enum kvm_gfn_range_filter attr_filter;
 	bool may_block;
 };
 bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range);
@@ -325,6 +325,33 @@ struct kvm_mmio_fragment {
 	void *data;
 	unsigned len;
 };
+
+enum forward_msg_type {
+	VGIC_V3_DIPATCH_SGI = 0x001,
+	KVM_MMIO,
+	VCPU_OFF,
+	TIMER,
+	VCPU_ON,
+	DSM_CC,
+};
+
+enum message_status {
+	KVM_MSG_IDLE = 0,       // 消息空闲，可写入
+	KVM_MSG_WRITTEN,        // KVM已写入消息
+	KVM_MSG_HAS_READ        // QEMU已读入消息
+};
+
+struct kvm_forward_message {
+	enum message_status status;      
+	bool is_unicast;                // 是否单发
+	int target_vcpu_id;             // 目标vcpu id,与is_unicast配合使用
+	uint16_t data_type;             // 消息类型
+	char data[128];					// 消息内容
+	uint16_t data_len;				// 消息内容长度
+	int return_code;				// 返回结果
+	char return_data[128];			// 返回数据
+	uint16_t return_data_len;		// 返回数据长度
+}
 
 struct kvm_vcpu {
 	struct kvm *kvm;
@@ -840,6 +867,14 @@ struct kvm {
 	unsigned long mmu_invalidate_range_start;
 	unsigned long mmu_invalidate_range_end;
 #endif
+	struct kvm_forward_message *forward_message;
+	struct mutex kvm_send_mag_lock;
+	struct mutex kvm_handle_msg_lock;
+	struct eventfd_ctx *forward_eventfd;  // 用于同步通信的eventfd
+	struct page *forward_page;     // 物理页面
+	unsigned long forward_gfn;     // 页面帧号
+
+
 	struct list_head devices;
 	u64 manual_dirty_log_protect;
 	struct dentry *debugfs_dentry;
@@ -853,6 +888,16 @@ struct kvm {
 	bool dirty_ring_with_bitmap;
 	bool vm_bugged;
 	bool vm_dead;
+
+	struct task_struct *dsm_thread;
+	int dsm_id;
+	struct mutex conn_lock;
+	struct ktcp_cb *conn_sock;
+	int port_id;
+	int local_index;
+	int local_cpus;
+	int cluster_iplist_len;
+	char **cluster_iplist;
 
 #ifdef CONFIG_HAVE_KVM_PM_NOTIFIER
 	struct notifier_block pm_notifier;

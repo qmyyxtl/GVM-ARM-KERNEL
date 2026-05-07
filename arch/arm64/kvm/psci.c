@@ -57,8 +57,79 @@ static inline bool kvm_psci_valid_affinity(struct kvm_vcpu *vcpu,
 	return !(affinity & ~MPIDR_HWID_BITMASK);
 }
 
+int send_cpu_on_task(struct kvm *kvm, struct vcpu_reset_state *reset_state, usigned long cpu_id)
+{
+	typedef struct cpu_on_request {
+		struct vcpu_reset_state reset_state_t;
+		unsigned long cpu_id;
+	};
+	struct cpu_on_request req = {
+		.reset_state_t = *reset_state,
+		.cpu_id = cpu_id,
+	};
+
+	printk(KERN_INFO "send req is pc = %lu, r0 = %lu, be = %d, cpu_id = %lu\n",
+	       req.reset_state_t.pc, req.reset_state_t.r0, req.reset_state_t.be, req.cpu_id);
+		
+	const char *tar_ip = kvm->cluster_iplist[kvm->local_index?0:1];
+	int ret = ktcp_send_to_vCpu(tar_ip, kvm, 0x3333, (const char *)&req, sizeof(struct cpu_on_request));
+	printk(KERN_INFO "ktcp_send_to_vCpu ret = %d\n", ret);
+	return ret;
+}
+
+int handle_cpu_on_task(struct kvm *kvm, struct vcpu_reset_state *reset_state, unsigned long cpu_id)
+{
+	struct kvm_vcpu *vcpu;
+	int ret = PSCI_RET_SUCCESS;
+	struct vcpu_reset_state *reset_state;
+	vcpu = kvm_get_vcpu(kvm, cpu_id);
+	if (!vcpu) {
+		printk(KERN_ERR "Invalid CPU ID %lu\n", cpu_id);
+		return PSCI_RET_INVALID_PARAMS;
+	}
+	printk(KERN_INFO "handle_cpu_on_task kvm = %p, pc = %lu, r0 = %lu, be = %d, cpu_id = %lu\n,
+	       vcpu_id = %d, vcpu_mp_state = %d\n",
+	       kvm, reset_state->pc, reset_state->r0, reset_state->be, cpu_id, vcpu->vcpu_id, vcpu->arch.mp_state.mp_state);
+	spin_lock(&vcpu->arch.mp_state_lock);
+
+	if (!kvm_arm_vcpu_stopped(vcpu)) {
+		printk(KERN_ERR "CPU ID %lu is not in stopped state\n", cpu_id);
+		ret = PSCI_RET_ALREADY_ON;
+		goto out_unlock;
+	}
+	reset_state = &vcpu->arch.reset_state;
+	reset_state->pc = reset_state->pc;
+
+	/* Propagate caller endianness */
+	reset_state->be = reset_state->be;
+	/*
+	 * NOTE: We always update r0 (or x0) because for PSCI v0.1
+	 * the general purpose registers are undefined upon CPU_ON.
+	 */
+	reset_state->r0 = reset_state->r0;
+
+	reset_state->reset = true;
+	kvm_make_request(KVM_REQ_VCPU_RESET, vcpu);
+
+	/*
+	 * Make sure the reset request is observed if the RUNNABLE mp_state is
+	 * observed.
+	 */
+	smp_wmb();
+
+	WRITE_ONCE(vcpu->arch.mp_state.mp_state, KVM_MP_STATE_RUNNABLE);
+	bool wake_up;
+	wake_up = kvm_vcpu_wake_up(vcpu);
+	pr_info("kvm_vcpu_wake_up ret = %d\n", wake_up);
+
+out_unlock:
+	spin_unlock(&vcpu->arch.mp_state_lock);
+	return ret;
+}
+
 static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
 {
+	printk("kvm called vcpu on by id %lu\n", smccc_get_arg1(source_vcpu));
 	struct vcpu_reset_state *reset_state;
 	struct kvm *kvm = source_vcpu->kvm;
 	struct kvm_vcpu *vcpu = NULL;
@@ -117,15 +188,21 @@ static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
 	smp_wmb();
 
 	WRITE_ONCE(vcpu->arch.mp_state.mp_state, KVM_MP_STATE_RUNNABLE);
-	kvm_vcpu_wake_up(vcpu);
+
+	bool wake_up;
+	wake_up = kvm_vcpu_wake_up(vcpu);
+	if (vcpu->vcpu_id >= vcpu->kvm->local_cpus) {
+		pr_info("send_cpu_on_task for vcpu_id %lu\n", vcpu->vcpu_id);
+		send_cpu_on_task(vcpu->kvm, reset_state, vcpu->vcpu_id);
+	}
 
 out_unlock:
 	spin_unlock(&vcpu->arch.mp_state_lock);
-	if (vcpu_is_rec(vcpu) && ret != PSCI_RET_SUCCESS) {
-		realm_psci_complete(source_vcpu, vcpu,
-				    ret == PSCI_RET_ALREADY_ON ?
-				    PSCI_RET_SUCCESS : PSCI_RET_DENIED);
-	}
+	// if (vcpu_is_rec(vcpu) && ret != PSCI_RET_SUCCESS) {
+	// 	realm_psci_complete(source_vcpu, vcpu,
+	// 			    ret == PSCI_RET_ALREADY_ON ?
+	// 			    PSCI_RET_SUCCESS : PSCI_RET_DENIED);
+	// }
 	return ret;
 }
 
@@ -191,10 +268,48 @@ static unsigned long kvm_psci_vcpu_affinity_info(struct kvm_vcpu *vcpu)
 	return PSCI_0_2_AFFINITY_LEVEL_OFF;
 }
 
+int send_cpu_off(struct kvm_vcpu *vcpu, u32 type, u64 flags)
+{
+	struct vcpu_off_state req = {
+		.vcpu_id = vcpu->vcpu_id,
+		.type = type,
+		.flags = flags,
+	}
+	printk(KERN_INFO "send req is vcpu_id = %d, type = %u, flags = %lu\n",
+	       req.vcpu_id, req.type, req.flags);
+	const char *tar_ip = vcpu->kvm->cluster_iplist[vcpu->kvm->local_index?0:1];
+	int ret = ktcp_send_to_vCpu(tar_ip, vcpu->kvm, 0x9999, (const char *)&req, sizeof(struct vcpu_off_state));
+	printk(KERN_INFO "ktcp_send_to_vCpu ret = %d\n", ret);
+	return ret;
+}
+
+int handle_cpu_off(struct kvm *kvm, struct vcpu_off_state *req)
+{
+	struct kvm_vcpu *vcpu = kvm_get_vcpu(kvm, req->vcpu_id);
+	unsigned long i;
+	struct kvm_vcpu *tmp;
+	kvm_for_each_vcpu(i, tmp, kvm) {
+		spin_lock(&tmp->arch.mp_state_lock);
+		WRITE_ONCE(tmp->arch.mp_state.mp_state, KVM_MP_STATE_STOPPED);
+		spin_unlock(&tmp->arch.mp_state_lock);
+	}
+	kvm_make_all_cpus_request(kvm, KVM_REQ_SLEEP);
+	pr_info("handle_cpu_off for vcpu_id %d, type = %u, flags = %lu\n",
+	       req->vcpu_id, req->type, req->flags);
+	memset(&vcpu->run->system_event, 0, sizeof(vcpu->run->system_event));
+	vcpu->run->system_event.type = req->type;
+	vcpu->run->system_event.ndata = 1;
+	vcpu->run->system_event.data[0] = req->flags;
+	vcpu->run->exit_reason = KVM_EXIT_SYSTEM_EVENT;
+	return 0;
+}
+
 static void kvm_prepare_system_event(struct kvm_vcpu *vcpu, u32 type, u64 flags)
 {
 	unsigned long i;
 	struct kvm_vcpu *tmp;
+
+	send_cpu_off(vcpu, type, flags);
 
 	/*
 	 * The KVM ABI specifies that a system event exit may call KVM_RUN
@@ -477,6 +592,8 @@ int kvm_psci_call(struct kvm_vcpu *vcpu)
 		smccc_set_retval(vcpu, val, 0, 0, 0);
 		return 1;
 	}
+
+	pr_info("kvm_psci_call fn = 0x%x, version = 0x%x\n", psci_fn, version);
 
 	switch (version) {
 	case KVM_ARM_PSCI_1_1:

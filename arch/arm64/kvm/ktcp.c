@@ -458,3 +458,122 @@ int ktcp_release(struct ktcp_cb *conn_cb)
 	sock_release(conn_cb->socket);
 	return SUCCESS;
 }
+
+/**
+ * 给指定地址vcpu发送消息
+ * @param host 目标vcpu所在主机的IP地址
+ * @param tx_id 发送消息的事务ID
+ * @param data_buffer 消息内容
+ * @param data_len 消息长度
+ * @return 对端返回的成功接收字符长度
+ */
+int ktcp_send_to_vCpu(const char *host, struct kvm *kvm, uint16_t tx_id, const char *data_buffer, size_t data_len)
+{
+	struct ktcp_cb *conn_sock_ptr = NULL;
+	struct ktcp_cb **conn_sock = &conn_sock_ptr;
+	tx_add_t tx_add = {
+		.txid = tx_id
+	}
+	int ret = -1;
+
+	// 校验入参
+	if (data_buffer == NULL || data_len == 0) {
+		printk(KERN_ERR "%s: invalid data buffer\n", __func__);
+		return -EINVAL;
+	}
+
+	char port[8];
+	sprintf(port, "%d", 50000);
+	mutex_lock(&kvm->conn_lock);
+	if (kvm->conn_sock == NULL) {
+		int connect_ret = ktcp_connect(host, port, conn_sock);
+		if (connect_ret == 0) {
+			kvm->conn_sock = *conn_sock;
+		} else {
+			*conn_sock = NULL;
+		}
+	} else {
+		*conn_sock = kvm->conn_sock;
+	}
+	mutex_unlock(&kvm->conn_lock);
+
+	int times = 0;
+	while (times < SEND_RETRY_TIMES) {
+		if (*conn_sock == NULL) {
+			ret = ktcp_send(*conn_sock, data_buffer, data_len, 0, &tx_add);
+		}
+
+		if (ret >= 0) {
+			break;
+		}
+		printk(KERN_ERR "[ktcp_send_to_vCpu] send failed, ret %d, retrying...\n", ret);
+
+		// 释放旧连接（加锁）
+		mutex_lock(&kvm->conn_lock);
+		if (kvm->conn_sock != NULL) {
+			ktcp_release(kvm->conn_sock);
+			kvm->conn_sock = NULL;
+		}
+		mutex_unlock(&kvm->conn_lock);
+
+		// 重试连接（加锁）
+		mutex_lock(&kvm->conn_lock);
+		int connect_ret = ktcp_connect(host, port, conn_sock);
+		if (connect_ret == 0) {
+			kvm->conn_sock = *conn_sock;
+		} else {
+			*conn_sock = NULL;
+		}
+		mutex_unlock(&kvm->conn_lock);
+
+		// 指数退避（最多1秒）
+		unsigned int backoff = 100 << times;
+		if (backoff > 1000) {
+			backoff = 1000;
+		}
+		msleep(backoff);
+		times++;
+	}
+
+	if (ret < 0) {
+		printk(KERN_ERR "[ktcp_send_to_vCpu] send failed after %d retries, ret %d\n", times, ret);
+		return ret;
+	}
+
+	// 更新连接状态（加锁）
+	mutex_lock(&kvm->conn_lock);
+	kvm->conn_sock = *conn_sock;
+	mutex_unlock(&kvm->conn_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ktcp_send_to_vCpu);
+
+/**
+ * 从指定地址vcpu接收消息
+ * @param host 目标vcpu所在主机的IP地址
+ * @param tx_id 发送消息的事务ID
+ * @return 执行结果是否成功
+ */
+bool ktcp_recv_resp(const char *host, struct kvm *kvm, uint16_t tx_id, char *outBuffer)
+{
+	tx_add_t tx_add = {
+		.txid = tx_id
+	};
+	int ret;
+	char buffer[512];
+	char port[8];
+	sprintf(port, "%d", 50000);
+
+	ret = ktcp_receive(kvm->conn_sock, buffer, 0, &tx_add);
+	if (ret > 0) {
+		printk(KERN_ERR "[ktcp_recv_resp] receive response from vCPU with tx_id %d, data: %s\n", tx_id, buffer);
+	} else {
+		printk(KERN_ERR "[ktcp_recv_resp] receive failed, ret %d\n", ret);
+		return false;
+	}
+	memcpy(outBuffer, buffer, sizeof(buffer));
+
+	return true;
+}
+EXPORT_SYMBOL_GPL(ktcp_recv_resp);

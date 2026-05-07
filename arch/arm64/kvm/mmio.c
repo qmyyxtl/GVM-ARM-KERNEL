@@ -165,9 +165,59 @@ int kvm_handle_mmio_return(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+int send_mmio_write(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa, int len,
+			int write_mmio, unsigned long data)
+{
+	int ret;
+	struct mmio_request req = {
+		.vcpu_id = vcpu->vcpu_id,
+		.bus_idx = KVM_MMIO_BUS,
+		.fault_ipa = fault_ipa,
+		.len = len,
+		.data = data,
+		.is_write_mmio = write_mmio
+	};
+
+	const char* tar_ip = vcpu->kvm->cluster_iplist[vcpu->kvm->local_index?0:1];
+	ret = ktcp_send_to_vCpu(tar_ip, vcpu->kvm, 0x4444, (const char *)&req, sizeof(struct mmio_request));
+
+	return ret;
+}
+
+unsigned long handle_mmio_write(struct kvm *kvm, struct mmio_request *req, int *result)
+{
+	struct kvm_vcpu *vcpu;
+	u8 data_buf[8];
+	int ret,idx;
+	unsigned long data;
+	vcpu = kvm_get_vcpu(kvm, req->vcpu_id);
+	if (!vcpu) {
+		printk(KERN_ERR "[UVVM] Invalid vCPU ID: %d\n", req->vcpu_id);
+		return -1;
+	}
+
+	if (req->is_write_mmio == 1) {
+		kvm_mmio_write_buf(data_buf, req->len, req->data);
+		ret = kvm_io_bus_write(vcpu, req->bus_idx, req->fault_ipa, req->len, data_buf);
+		sru_read_unlock(&vcpu->kvm->srcu, idx);
+		*result = ret;
+		return data;
+	} else if (req->is_write_mmio == 0) {
+		ret = kvm_io_bus_read(vcpu, req->bus_idx, req->fault_ipa, req->len, data_buf);
+		data = kvm_mmio_read_buf(data_buf, req->len);
+		sru_read_unlock(&vcpu->kvm->srcu, idx);
+		*result = ret;
+		return data;
+	} else {
+		printk(KERN_ERR "[UVVM] Invalid MMIO request type: %d\n", req->is_write_mmio);
+	}
+
+	srcu_read_unlock(&vcpu->kvm->srcu, idx);
+	return 0;
+}
+
 int io_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
 {
-	printk("KVM: IO mem abort at IPA 0x%llx\n", fault_ipa);
 	struct kvm_run *run = vcpu->run;
 	unsigned long data;
 	unsigned long rt;
@@ -206,6 +256,7 @@ int io_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
 	is_write = kvm_vcpu_dabt_iswrite(vcpu);
 	len = kvm_vcpu_dabt_get_as(vcpu);
 	rt = kvm_vcpu_dabt_get_rd(vcpu);
+	const char* tar_ip = vcpu->kvm->cluster_iplist[vcpu->kvm->local_index?0:1];
 
 	if (is_write) {
 		data = vcpu_data_guest_to_host(vcpu, vcpu_get_reg(vcpu, rt),
@@ -216,12 +267,37 @@ int io_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
 
 		ret = kvm_io_bus_write(vcpu, KVM_MMIO_BUS, fault_ipa, len,
 				       data_buf);
+		if (!(fault_ipa >= 0x9000000 && fault_ipa < 0x9001000)) {
+			pr_info("[UVVM] MMIO write: vCPU %d, IPA 0x%llx, data 0x%lx, len %d, ret %d\n",
+				vcpu->vcpu_id, (unsigned long long)fault_ipa, data, len, ret);
+		}
+		if (ret == 0 && ((fault_ipa >= 0x8000000 && fault_ipa < 0x80a0000) || fault_ipa == 0x80a00a0)) {
+			ret = send_mmio_write(vcpu, fault_ipa, len, 1, data);
+			char out_buffer[512];
+			ret = ktcp_recv_resp(tar_ip, vcpu->kvm, 0x5555, out_buffer);
+			memcpy(&ret, out_buffer + sizeof(data), sizeof(ret));
+			pr_info("[UVVM] MMIO write forwarded: vCPU %d, IPA 0x%llx, data 0x%lx, len %d, ret %d\n",
+				vcpu->vcpu_id, (unsigned long long)fault_ipa, data, len, ret);
+			ret = 0;
+		} else if (ret == 0 && vcpu->vcpu_id >= vcpu->kvm->local_cpus && fault_ipa >= 0x8000000000) {
+			ret = send_mmio_write(vcpu, fault_ipa, len, 1, data);
+			char out_buffer[512];
+			ret = ktcp_recv_resp(tar_ip, vcpu->kvm, 0x5555, out_buffer);
+			memcpy(&ret, out_buffer + sizeof(data), sizeof(ret));
+			pr_info("[UVVM] MMIO write forwarded: vCPU %d, IPA 0x%llx, data 0x%lx, len %d, ret %d\n",
+				vcpu->vcpu_id, (unsigned long long)fault_ipa, data, len, ret);
+			ret = 0;
+		}
 	} else {
 		trace_kvm_mmio(KVM_TRACE_MMIO_READ_UNSATISFIED, len,
 			       fault_ipa, NULL);
 
 		ret = kvm_io_bus_read(vcpu, KVM_MMIO_BUS, fault_ipa, len,
 				      data_buf);
+		if (!(fault_ipa >= 0x9000000 && fault_ipa < 0x9001000)) {
+			pr_info("[UVVM] MMIO read: vCPU %d, IPA 0x%llx, len %d, ret %d\n",
+				vcpu->vcpu_id, (unsigned long long)fault_ipa, len, ret);
+		}
 	}
 
 	/* Now prepare kvm_run for the potential return to userland. */

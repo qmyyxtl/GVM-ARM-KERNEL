@@ -1090,6 +1090,9 @@ static int dispatch_mmio_read(struct kvm_vcpu *vcpu, struct kvm_io_device *dev,
 		data = region->read(vcpu, addr, len);
 		break;
 	case IODEV_REDIST:
+		if (vcpu->vcpu_id/vcpu->kvm->local_cpus!=iodev->redist_vcpu->vcpu_id/vcpu->kvm->local_cpus) {
+			pr_info("dispatch_mmio_read: vcpu%d redist_vcpu%d\n", vcpu->vcpu_id, iodev->redist_vcpu->vcpu_id);
+		}
 		data = region->read(iodev->redist_vcpu, addr, len);
 		break;
 	case IODEV_ITS:
@@ -1120,6 +1123,9 @@ static int dispatch_mmio_write(struct kvm_vcpu *vcpu, struct kvm_io_device *dev,
 		region->write(vcpu, addr, len, data);
 		break;
 	case IODEV_REDIST:
+		if (vcpu->vcpu_id/vcpu->kvm->local_cpus!=iodev->redist_vcpu->vcpu_id/vcpu->kvm->local_cpus) {
+			pr_info("dispatch_mmio_write: vcpu%d redist_vcpu%d\n", vcpu->vcpu_id, iodev->redist_vcpu->vcpu_id);
+		}
 		region->write(iodev->redist_vcpu, addr, len, data);
 		break;
 	case IODEV_ITS:

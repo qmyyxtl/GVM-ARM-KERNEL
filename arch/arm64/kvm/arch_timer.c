@@ -244,6 +244,8 @@ static inline void cvm_vcpu_put_timer_callback(struct kvm_vcpu *vcpu)
 
 static void timer_set_offset(struct arch_timer_context *ctxt, u64 offset)
 {
+	pr_info("timer_set_offset: vcpu %u, timer %ld, offset 0x%llx\n",
+		ctxt->vcpu->vcpu_id, arch_timer_ctx_index(ctxt), offset);
 	struct kvm_vcpu *vcpu = ctxt->vcpu;
 
 	if (kvm_is_realm(vcpu->kvm)) {
@@ -559,20 +561,20 @@ static void kvm_timer_update_irq(struct kvm_vcpu *vcpu, bool new_level,
 	}
 }
 
-void kvm_realm_timers_update(struct kvm_vcpu *vcpu)
-{
-	struct arch_timer_cpu *arch_timer = &vcpu->arch.timer_cpu;
-	int i;
+// void kvm_realm_timers_update(struct kvm_vcpu *vcpu)
+// {
+// 	struct arch_timer_cpu *arch_timer = &vcpu->arch.timer_cpu;
+// 	int i;
 
-	for (i = 0; i < NR_KVM_EL0_TIMERS; i++) {
-		struct arch_timer_context *timer = &arch_timer->timers[i];
-		bool status = timer_get_ctl(timer) & ARCH_TIMER_CTRL_IT_STAT;
-		bool level = kvm_timer_irq_can_fire(timer) && status;
+// 	for (i = 0; i < NR_KVM_EL0_TIMERS; i++) {
+// 		struct arch_timer_context *timer = &arch_timer->timers[i];
+// 		bool status = timer_get_ctl(timer) & ARCH_TIMER_CTRL_IT_STAT;
+// 		bool level = kvm_timer_irq_can_fire(timer) && status;
 
-		if (level != timer->irq.level)
-			kvm_timer_update_irq(vcpu, level, timer);
-	}
-}
+// 		if (level != timer->irq.level)
+// 			kvm_timer_update_irq(vcpu, level, timer);
+// 	}
+// }
 
 /* Only called for a fully emulated timer */
 static void timer_emulate(struct arch_timer_context *ctx)
@@ -1249,19 +1251,20 @@ static void timer_context_init(struct kvm_vcpu *vcpu, int timerid)
 void kvm_timer_vcpu_init(struct kvm_vcpu *vcpu)
 {
 	struct arch_timer_cpu *timer = vcpu_timer(vcpu);
-	u64 cntvoff;
+	// u64 cntvoff;
 
 	for (int i = 0; i < NR_KVM_TIMERS; i++)
 		timer_context_init(vcpu, i);
 
-	if (kvm_is_realm(vcpu->kvm))
-		cntvoff = 0;
-	else
-		cntvoff = kvm_phys_timer_read();
+	// if (kvm_is_realm(vcpu->kvm))
+	// 	cntvoff = 0;
+	// else
+	// 	cntvoff = kvm_phys_timer_read();
 
 	/* Synchronize offsets across timers of a VM if not already provided */
 	if (!test_bit(KVM_ARCH_FLAG_VM_COUNTER_OFFSET, &vcpu->kvm->arch.flags)) {
 		timer_set_offset(vcpu_vtimer(vcpu), cntvoff);
+		pr_info("kvm_timer_vcpu_init voffset %lu vcpu_id %d\n", kvm_phys_timer_read(), vcpu->vcpu_id);
 		timer_set_offset(vcpu_ptimer(vcpu), 0);
 	}
 
@@ -1851,6 +1854,58 @@ out:
 }
 #endif
 
+int send_timer(struct kvm_vcpu *vcpu, u64 voffset, u64 poffset)
+{
+	int ret;
+	struct yjc_timer req = {
+		.vcpu_id = vcpu->vcpu_id,
+		.voffset = voffset,
+		.poffset = poffset
+	};
+	pr_info("send timer to vcpu %d, voffset: %llu, poffset: %llu\n",
+		vcpu->vcpu_id, voffset, poffset);
+	const char* tar_ip = vcpu->kvm->cluster_iplist[vcpu_kvm_local_index?0:1];
+	ret = ktcp_send_to_vCpu(tar_ip, vcpu->kvm, 0x8888, (const char*)&req, sizeof(struct yjc_timer));
+	return ret;
+}
+
+u64 get_remote_time(struct kvm_vcpu *vcpu)
+{
+	int ret;
+	u64 remote_time;
+	const char* tar_ip = vcpu->kvm->cluster_iplist[vcpu_kvm_local_index?0:1];
+	ret = ktcp_send_to_vCpu(tar_ip, vcpu->kvm, 0x9999, (const char*)&remote_time, sizeof(remote_time));
+	char out_buffer[512];
+	ret = ktcp_recv_resp(tar_ip, vcpu->kvm, 0x9999, out_buffer);
+	memcpy(&remote_time, out_buffer, sizeof(remote_time));
+	return remote_time;
+}
+
+int handle_timer_set(struct kvm *kvm, struct yjc_timer *req) 
+{
+	struct kvm_vcpu *vcpu;
+	vcpu = kvm_get_vcpu(kvm, req->vcpu_id);
+	if (!vcpu) {
+		pr_err("handle_timer_set: vcpu %d not found\n", req->vcpu_id);
+		return -1;
+	}
+	struct arch_timer_context *vtimer = vcpu_vtimer(vcpu);
+	struct arch_timer_context *ptimer = vcpu_ptimer(vcpu);
+	timer_set_offset(vtimer, req->voffset);
+	timer_set_offset(ptimer, req->poffset);
+	pr_info("handle_timer_set: set timer for vcpu %d, voffset: %llu, poffset: %llu\n",
+		req->vcpu_id, req->voffset, req->poffset);
+	return 0;
+}
+
+u64 get_time_offset(struct kvm_vcpu *vcpu)
+{
+	u64 start = kvm_phys_timer_read();
+	u64 remote_time = get_remote_time(vcpu);
+	u64 end = kvm_phys_timer_read();
+	return remote_time - (start + end) / 2;
+}
+
 int kvm_timer_enable(struct kvm_vcpu *vcpu)
 {
 	struct arch_timer_cpu *timer = vcpu_timer(vcpu);
@@ -1859,6 +1914,17 @@ int kvm_timer_enable(struct kvm_vcpu *vcpu)
 
 	if (timer->enabled)
 		return 0;
+
+	u64 offset = 0;
+	if (vcpu->vcpu_id == 0) {
+		offset = get_time_offset(vcpu);
+		pr_info("kvm_timer_enable: time offset for vcpu %d is %llu\n", vcpu->vcpu_id, offset);
+		struct arch_timer_context *vtimer = vcpu_vtimer(vcpu);
+		struct arch_timer_context *ptimer = vcpu_ptimer(vcpu);
+		u64 voffset = timer_get_offset(vtimer);
+		u64 poffset = timer_get_offset(ptimer);
+		send_timer(vcpu, voffset + offset, poffset);
+	}
 
 #ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
 	if (!irqchip_in_kernel(vcpu->kvm) && vtimer_is_irqbypass())

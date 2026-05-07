@@ -70,6 +70,9 @@
 #include <linux/kvm_dirty_ring.h>
 #include <linux/virtcca_cvm_domain.h>
 
+#include <../../arch/arm64/include/asm/kvm_host.h>
+#include <../../arch/arm64/kvm/dsm.h>
+
 /* Worst case buffer size needed for holding an integer. */
 #define ITOA_MAX_LEN 12
 
@@ -1454,6 +1457,15 @@ void kvm_put_kvm_no_destroy(struct kvm *kvm)
 	WARN_ON(refcount_dec_and_test(&kvm->users_count));
 }
 EXPORT_SYMBOL_GPL(kvm_put_kvm_no_destroy);
+
+struct ubsvm_conn {
+	struct list_head link;
+	struct kvm *kvm;
+	kconnection_t *sock;
+	struct task_struct *threads[8];
+}
+
+int g_dsm_id = 0;
 
 static int kvm_vm_release(struct inode *inode, struct file *filp)
 {
@@ -4250,6 +4262,22 @@ static long kvm_vcpu_ioctl(struct file *filp,
 	if (mutex_lock_killable(&vcpu->mutex))
 		return -EINTR;
 	switch (ioctl) {
+	case KVM_ININ_TIMER: {
+		const char* tar_ip = vcpu->kvm->cluster_iplist[vcpu->kvm->local_index?0:1];
+		int vcpuid = vcpu->vcpu_id;
+		if (vcpu->kvm->local_index ==0) {
+			ktcp_send_to_vCpu(tar_ip, vcpu->kvm, 0x7777, (const char*)&vcpuid, sizeof(int));
+			pr_info("send init timer to vcpu%d\n", vcpuid);
+		}
+		pr_info("run kvm_timer_vcpu_init local vcpuid %d local_index %d\n", vcpu->vcpu_id, vcpu->kvm->local_index);
+		kvm_timer_vcpu_init(vcpu);
+		break;
+	}
+	case KVM_SET_CPU_TP: {
+		printk(KERN_INFO "[UVVM] KVM_SET_CPU_TP vcpu_id %d\n", vcpu->vcpu_id);
+		r = kvm_vm_ioctl_set_cpu_ip(vcpu->kvm, arg);
+		break;
+	}
 	case KVM_RUN: {
 		struct pid *oldpid;
 		r = -EINVAL;
@@ -4906,6 +4934,57 @@ static int kvm_vm_ioctl_get_stats_fd(struct kvm *kvm)
 	return fd;
 }
 
+int forward_msg_handle(struct kvm *kvm, struct kvm_forward_message *msg)
+{
+	int ret = -1;
+	struct timespec64 start, prememcpy, mcy, prefree, free, end;
+	ktime_get_ts64(&start);
+	if (msg->data_type == VGIC_V3_DISPATCH_SGI) {
+		// TODO:
+		ret = 0;
+	} else if (msg->data_type == KVM_MMIO) {
+		// TODO:
+		ret = 0;
+	} else if (msg->data_type == VCPU_OFF) {
+		// TODO:
+		ret = 0;
+	} else if (msg->data_type == TIMER) {
+		// TODO:
+		ret = 0;
+	} else if (msg->data_type == VCPU_ON) {
+		// TODO:
+		ret = 0;
+	} else if (msg->data_type == DSM_CC) {
+		struct dsm_request* req = (struct dsm_request*)kmalloc(sizeof(struct dsm_request), GFP_KERNEL);
+		if (!req) {
+			ret = -ENOMEM;
+		}
+		ktime_get_ts64(&prememcpy);
+		memcpy(req, msg->data, sizeof(struct dsm_request));
+		ktime_get_ts64(&mcy);
+		ret = ivy_kvm_dsm_handle_req(kvm, req,msg);
+		ktime_get_ts64(&prefree);
+		kfree(req);
+		ktime_get_ts64(&free);
+		req = NULL;
+		ret = 0;
+	} else {
+		printk(KERN_WARNING "[UVVM] Unknown message type: %d\n", msg->data_type);
+	}
+
+	ktime_get_ts64(&end);
+	printk(KERN_INFO "[UVVM] Forward message handled, type: %d, ret: %d, time: %lld ns (total: %lld ns, prememcpy: %lld ns, memcpy: %lld ns, prefree: %lld ns, free: %lld ns)\n",
+		msg->data_type, ret,
+		(end.tv_sec - start.tv_sec) * 1000000000LL + (end.tv_nsec - start.tv_nsec),
+		(end.tv_sec - start.tv_sec) * 1000000000LL + (end.tv_nsec - start.tv_nsec),
+		(prememcpy.tv_sec - start.tv_sec) * 1000000000LL + (prememcpy.tv_nsec - start.tv_nsec),
+		(mcy.tv_sec - prememcpy.tv_sec	) * 1000000000LL + (mcy.tv_nsec - prememcpy.tv_nsec),
+		(prefree.tv_sec - mcy.tv_sec) * 1000000000LL + (prefree.tv_nsec - mcy.tv_nsec),
+		(free.tv_sec - prefree.tv_sec) * 1000000000LL + (free.tv_nsec - prefree.tv_nsec)
+	);
+	return ret;
+}
+
 static long kvm_vm_ioctl(struct file *filp,
 			   unsigned int ioctl, unsigned long arg)
 {
@@ -4916,6 +4995,11 @@ static long kvm_vm_ioctl(struct file *filp,
 	if (kvm->mm != current->mm || kvm->vm_dead)
 		return -EIO;
 	switch (ioctl) {
+	case KVM_SET_CPU_IP: {
+		printk(KERN_INFO "[UVVM] KVM_SET_CPU_IP\n");
+		r = kvm_vm_ioctl_set_cpu_ip(kvm, arg);
+		break;
+	}
 	case KVM_CREATE_VCPU:
 		r = kvm_vm_ioctl_create_vcpu(kvm, arg);
 		break;
@@ -5091,7 +5175,39 @@ static long kvm_vm_ioctl(struct file *filp,
 	case KVM_GET_STATS_FD:
 		r = kvm_vm_ioctl_get_stats_fd(kvm);
 		break;
+	case KVM_CREATE_MSG_FORWARD_EVENTFD: {
+		int event_fd;
+		// 从用户空间获取eventfd
+		if (copy_from_user(&event_fd, argp, sizeof(event_fd))) {
+			pritnk(KERN_INFO "[UVVM] Failed to copy eventfd from user space\n");
+			r = -EFAULT;
+			goto out;
+		}
+
+		r = kvm_create_msg_forward_eventfd(kvm, event_fd);
+		break;
+	}
+	case KVM_CREATE_MSG_FORWARD_SHARED_MEM: {
+		unsigned long user_addr = (unsigned long)argp;
+		r = kvm_create_msg_forward_shared_mem(kvm, user_addr);
+		break;
+	}
+	case KVM_HANDLE_FORWARD_MSG: {
+		struct kvm_forward_message msg;
+
+		if (copy_from_user(&msg, argp, sizeof(msg))) {
+			goto out;
+		}
+
+		r = forward_msg_handle(kvm, &msg);
+
+		if (copy_to_user(argp, &msg, sizeof(msg))) {
+			goto out;
+		}
+		break;
+	}
 	default:
+		printk(KERN_INFO "[UVVM] kvm default: %u\n", ioctl);
 		r = kvm_arch_vm_ioctl(filp, ioctl, arg);
 	}
 out:
@@ -5191,6 +5307,159 @@ bool file_is_kvm(struct file *file)
 }
 EXPORT_SYMBOL_GPL(file_is_kvm);
 
+typedef struct vgic_v3_dispatch_sgi_params {
+	int vcpu_id;
+	int sgi_id;
+	bool allow_group1;
+}
+
+/**
+ * 消息接受处理，接收vCpu中断转发消息
+ * @param data
+ * @return
+ */
+int kvm_handle_req(void *data)
+{
+	int ret = 0;
+	/* 获取连接消息	*/
+	struct ubsvm_conn *conn = (struct ubsvm_conn *)data;
+	kconnection_t *conn_sock = conn->conn_sock;
+	/* 最大缓冲区大小为PAGE_SIZE */
+	char buffer[512];
+	tx_add_t rx_tx_add_req = {
+		.txid = KTCP_CPU_REQ_ID
+	};
+	allow_signal(SIGKILL);
+	while (true) {
+		if (kthead_should_stop()) {
+			printk(KERN_ERR "kvm_handle_req: thread should stop\n");
+			return -EPIPE;
+		}
+
+		/* 接收消息	*/
+		int ret = ktcp_receive(conn_sock, buffer, 0, &rx_tx_add_req);
+		if (ret > 0) {
+			printk(KERN_ERR "kvm_handle_req: received message: %s\n", buffer);
+		} else {
+			printk(KERN_ERR "kvm_handle_req: failed to receive message, ret=%d\n", ret);
+			return ret;
+		}
+
+		// 解析请求并处理
+		struct vgic_v3_dispatch_sgi_params *send_params;
+		size_t size = sizeof(struct vgic_v3_dispatch_sgi_params);
+		size_t size_1 = sizeof(struct mmio_request);
+		size_t size_2 = sizeof(struct vcpu_off_state);
+		size_t size_3 = sizeof(struct yjc_timer);
+		size_t size_4 = sizeof(struct cpu_on_request);
+		size_t size_5 = sizeof(struct tlbi_request);
+
+		if (size == ret) {
+			pr_info("handle mmio abort\n");
+
+			send_params = kmalloc(size, GFP_KERNEL);
+			if (!send_params) {
+				return -ENOMEM;
+			}
+			memcpy(send_params, buffer, size);
+
+			kthread_use_mm(conn->kvm->mm);
+			ret = vgic_v3_dispatch_sgi_remote_handle(conn->kvm, send_params->vcpu_id, send_params->sgi_id, send_params->allow_group1);
+			kthread_unuse_mm(conn->kvm->mm);
+			tx_add_t rx_tx_add_resp = {
+				.txid = 0x6666+send_params->vcpu_id
+			};
+			ktcp_send(conn_sock, (char*)&ret, sizeof(int), 0, &rx_tx_add_resp);
+		} else if (ret == size_1) {
+			struct mmio_request* mmio_req = (struct mmio_request*)kmalloc(size_1, GFP_KERNEL);
+			if (!mmio_req) {
+				return -ENOMEM;
+			}
+			memcpy(mmio_req, buffer, size_1);
+			int result = 0;
+			kthread_use_mm(conn->kvm->mm);
+			unsigned long data = handle_mmio_write(conn->kvm, mmio_req, &result);
+			kthread_unuse_mm(conn->kvm->mm);
+			tx_add_t rx_tx_add_resp = {
+				.txid = 0x5555
+			};
+			typedef struct resp {
+				unsigned long data;
+				int result;
+			};
+			struct resp res = {
+				.data = data,
+				.result = result
+			};
+			ret = ktcp_send(conn_sock, (char*)&res, sizeof(res), 0, &rx_tx_add_resp);
+			if (ret < 0) {
+				printk(KERN_ERR "kvm_handle_req: failed to send response, ret=%d\n", ret);
+			}
+		} else if (ret == size_2) {
+			pr_info("handle vcpu off state request\n");
+			struct vcpu_off_state* off_state_req = (struct vcpu_off_state*)kmalloc(size_2, GFP_KERNEL);
+			memcpy(off_state_req, buffer, size_2);
+			kthread_use_mm(conn->kvm->mm);
+			handle_cpu_off(conn->kvm, off_state_req);
+			kthread_unuse_mm(conn->kvm->mm);
+		} else if (ret == size_3) {
+			pr_info("handle timer request\n");
+			struct yjc_timer* timer_req = (struct yjc_timer*)kmalloc(size_3, GFP_KERNEL);
+			memcpy(timer_req, buffer, size_3);
+			kthread_use_mm(conn->kvm->mm);
+			handle_timer_set(conn->kvm, timer_req);
+			kthread_unuse_mm(conn->kvm->mm);
+		} else if (ret == sizeof(u64)) {
+			u64 remote_time = kvm_phys_timer_read();
+			tx_add_t rx_tx_add_resp = {
+				.txid = 0x9999
+			};
+			pr_info("handle remote time request, remote_time=%llu\n", remote_time);
+			ret = ktcp_send(conn_sock, (char*)&remote_time, sizeof(remote_time), 0, &rx_tx_add_resp);
+		} else if (ret == sizeof(int)) {
+			int vcpuid = 0;
+			memcpy(&vcpuid, buffer, sizeof(int));
+			pr_info("handle vcpu on request, vcpuid=%d\n", vcpuid);
+			kthread_use_mm(conn->kvm->mm);
+			kvm_timer_vcpu_init(kvm_get_vcpu(conn->kvm, vcpuid));
+			kthread_unuse_mm(conn->kvm->mm);
+		} else if (ret == size_4) {
+			struct cpu_on_request* on_req = (struct cpu_on_request*)kmalloc(size_4, GFP_KERNEL);
+			if (!on_req) {
+				return -ENOMEM;
+			}
+			memcpy(on_req, buffer, size_4);
+			pr_info("send req is pc = %llx, cpu_id = %d\n", on_req->entry_point, on_req->cpu_id);
+			kthread_use_mm(conn->kvm->mm);
+			ret = handle_cpu_on_task(conn->kvm, &(req->reset_state_t), on_req->cpu_id);
+			kthread_unuse_mm(conn->kvm->mm);
+			pr_info("handle cpu on request, cpu_id=%d, ret=%d\n", on_req->cpu_id, ret);
+		} else if (ret == size_5) {
+			struct tlbi_request* tlbi_req = (struct tlbi_request*)kmalloc(size_5, GFP_KERNEL);
+			if (!tlbi_req) {
+				return -ENOMEM;
+			}
+			memcpy(tlbi_req, buffer, size_5);
+			pr_info("handle tlbi request\n");
+			kthread_use_mm(conn->kvm->mm);
+			ret = handle_tlbi_remote(conn->kvm, &(req->tlb_info), req->vcpu_id);
+			tx_add_t rx_tx_add_resp = {
+				.txid = 0x1234
+			};
+			kthread_unuse_mm(conn->kvm->mm);
+		} else {
+			pr_err("kvm_handle_req: unknown message size %d\n", ret);
+		}
+
+		if (send_params) {
+			kfree(send_params);
+			send_params = NULL;
+		}
+	}
+
+	return ret;
+}
+
 static int kvm_dev_ioctl_create_vm(unsigned long type)
 {
 	char fdname[ITOA_MAX_LEN + 1];
@@ -5227,6 +5496,19 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
 	kvm_uevent_notify_change(KVM_EVENT_CREATE_VM, kvm);
 
 	fd_install(fd, file);
+	// 起监听线程
+	struct task_struct *thread;
+	kvm->dsm_id = g_dsm_id;
+	if (g_dsm_id < 15535) {
+		g_dsm_id++;
+	} else {
+		g_dsm_id = 0;
+	}
+	thread = kthread_run(kvm_dsm_thread, (void *)kvm, "kvm_dsm_thread/%d", kvm->dsm_id);
+	if (IS_ERR(thread)) {
+		printk(KERN_ERR "Failed to create kvm_dsm_thread, error: %ld\n", PTR_ERR(thread));
+	}
+	kvm->dsm_thread = thread;
 	return fd;
 
 put_kvm:
@@ -5234,6 +5516,76 @@ put_kvm:
 put_fd:
 	put_unused_fd(fd);
 	return r;
+}
+
+static int kvm_vm_ioctl_set_cpu_ip(struct kvm *kvm, long arg)
+{
+	int ret = 0;
+	struct kvm_vcpu_ip kvm_vcpu_ip;
+	void __user *argp = (void __user *)arg;
+
+	printk(KERN_INFO "[UVVM] kvm_vm_ioctl_set_cpu_ip start\n");
+	if (copy_from_user(&kvm_vcpu_ip, argp, sizeof(kvm_vcpu_ip))) {
+		printk(KERN_ERR "Failed to copy kvm_vcpu_ip from user\n");
+		return -EINVAL;
+	}
+
+	printk(KERN_INFO "[UVVM] kvm_vm_ioctl_set_cpu_ip local_index: %d, local_cpus: %d, cluster_iplist_len: %d\n",
+		kvm_vcpu_ip.local_index, kvm_vcpu_ip.local_cpus, kvm_vcpu_ip.cluster_iplist_len);
+	kvm->local_index = kvm_vcpu_ip.local_index;
+	kvm->local_cpus = kvm_vcpu_ip.local_cpus;
+	kvm->cluster_iplist_len = kvm_vcpu_ip.cluster_iplist_len;
+
+	kvm->cluster_iplist = (char **)kzalloc(sizeof(void *) * kvm->cluster_iplist_len, GFP_KERNEL);
+	if (!kvm->cluster_iplist) {
+		printk(KERN_ERR "[UVVM] kvm_vm_ioctl_set_cpu_ip cluster_iplist malloc failed\n");
+		return -ENOMEM;
+	}
+
+	char **hosts;
+	hosts = (char **)kzalloc(sizeof(void *) * kvm->cluster_iplist_len, GFP_KERNEL);
+	if (!hosts) {
+		printk(KERN_INFO "[UVVM] kvm_vm_ioctl_set_cpu_ip hosts malloc failed\n");
+		kfree(kvm->cluster_iplist);
+		return -ENOMEM;
+	}
+
+	ret = copy_from_user(hosts, (void __user *)kvm_vcpu_ip.cluster_iplist, sizeof(void *) * kvm->cluster_iplist_len);
+	if (ret) {
+		printk(KERN_ERR "[UVVM] kvm_vm_ioctl_set_cpu_ip copy cluster_iplist from user failed, ret: %d\n", ret);
+		kfree(kvm->cluster_iplist);
+		kfree(hosts);
+		return -ENOMEM;
+	}
+
+	for (int i = 0; i < kvm->cluster_iplist_len; i++) {
+		kvm->cluster_iplist[i] = (char *)kzalloc(20, GFP_KERNEL);
+		if (!kvm->cluster_iplist[i]) {
+			for (int j = 0;j < i; j++) {
+				kfree(kvm->cluster_iplist[j]);
+			}
+			kfree(kvm->cluster_iplist);
+			kfree(hosts);
+			return -ENOMEM;
+		}
+
+		ret = strncpy_from_user(kvm->cluster_iplist[i], hosts[i], 20);
+		if (ret < 0) {
+			printk(KERN_ERR "[UVVM] kvm_vm_ioctl_set_cpu_ip copy cluster_iplist[%d] from user failed, ret: %d\n", i, ret);
+			for (int j = 0;j <= i; j++) {
+				kfree(kvm->cluster_iplist[j]);
+			}
+			kfree(kvm->cluster_iplist);
+			kfree(hosts);
+			return ret;
+		}
+		printk(KERN_INFO "[UVVM] kvm_vm_ioctl_set_cpu_ip cluster_iplist[%d]: %s\n", i, kvm->cluster_iplist[i]);
+	}
+
+	printk(KERN_INFO "[UVVM] kvm_vm_ioctl_set_cpu_ip end\n");
+	kfree(hosts);
+
+	return ret;
 }
 
 static long kvm_dev_ioctl(struct file *filp,

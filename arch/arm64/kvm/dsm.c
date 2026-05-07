@@ -810,7 +810,6 @@ out:
 int kvm_dsm_mempin(struct kvm *kvm, unsigned long host_virt_addr,
 		unsigned long length, bool write, bool unpin)
 {
-	printk("%s (%s:%d)\n", __func__, __FILE__, __LINE__);
 	struct kvm_dsm_memory_slot *slot;
 	struct kvm_memory_slot *memslot;
 	hfn_t vfn, vfn_end;

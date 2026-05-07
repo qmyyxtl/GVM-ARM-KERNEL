@@ -46,7 +46,9 @@
 #include <kvm/arm_hypercalls.h>
 #include <kvm/arm_pmu.h>
 #include <kvm/arm_psci.h>
+
 #include "dsm.h"
+#include "ktcp.h"
 
 static enum kvm_mode kvm_mode = KVM_MODE_DEFAULT;
 
@@ -323,6 +325,12 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 	mutex_lock(&kvm->arch.config_lock);
 	mutex_unlock(&kvm->arch.config_lock);
 	mutex_unlock(&kvm->lock);
+#endif
+
+#ifdef CONFIG_KVM_DSM
+	ret = kvm_dsm_alloc(kvm);
+	if (ret < 0)
+		return ret;
 #endif
 
 	if (type & ~(KVM_VM_TYPE_ARM_MASK | KVM_VM_TYPE_ARM_IPA_SIZE_MASK))

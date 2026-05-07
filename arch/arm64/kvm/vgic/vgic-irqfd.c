@@ -109,6 +109,8 @@ int kvm_set_msi(struct kvm_kernel_irq_routing_entry *e,
 		struct kvm *kvm, int irq_source_id,
 		int level, bool line_status)
 {
+	pr_info("kvm_set_msi: e->msi.address_hi: %u, e->msi.address_lo: %u, e->msi.data: %u, e->msi.flags: %u, e->msi.devid: %u\n",
+		e->msi.address_hi, e->msi.address_lo, e->msi.data, e->msi.flags, e->msi.devid);
 	struct kvm_msi msi;
 
 	if (!vgic_has_its(kvm))

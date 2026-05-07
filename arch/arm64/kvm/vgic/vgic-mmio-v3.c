@@ -8,6 +8,7 @@
 #include <linux/kvm.h>
 #include <linux/kvm_host.h>
 #include <linux/interrupt.h>
+#include <linux/delay.h>
 #include <kvm/iodev.h>
 #include <kvm/arm_vgic.h>
 
@@ -17,6 +18,7 @@
 
 #include "vgic.h"
 #include "vgic-mmio.h"
+#include "../ktcp.h"
 
 /* extract @num bytes at @offset bytes offset in data */
 unsigned long extract_bytes(u64 data, unsigned int offset,
@@ -114,7 +116,7 @@ static void vgic_mmio_write_v3_misc(struct kvm_vcpu *vcpu,
 				    unsigned long val)
 {
 	struct vgic_dist *dist = &vcpu->kvm->arch.vgic;
-
+	pr_info("[gvmdebug] vgic_mmio_write_v3_misc vcpu id: %d, addr: 0x%llx, val: 0x%lx\n", vcpu->vcpu_id, (unsigned long long)addr, val);
 	switch (addr & 0x0c) {
 	case GICD_CTLR: {
 		bool was_enabled, is_hwsgi;
@@ -385,19 +387,23 @@ static int vgic_v3_uaccess_write_pending(struct kvm_vcpu *vcpu,
 
 		raw_spin_lock_irqsave(&irq->irq_lock, flags);
 
+		if (test_bit(i, &val)) {
 		/*
 		 * pending_latch is set irrespective of irq type
 		 * (level or edge) to avoid dependency that VM should
 		 * restore irq config before pending info.
 		 */
-		irq->pending_latch = test_bit(i, &val);
+		// irq->pending_latch = test_bit(i, &val);
+			irq->pending_latch = true;
+			vgic_queue_irq_unlock(vcpu->kvm, irq, flags);
+		} else {
 
-		if (irq->hw && vgic_irq_is_sgi(irq->intid)) {
-			irq_set_irqchip_state(irq->host_irq,
-					      IRQCHIP_STATE_PENDING,
-					      irq->pending_latch);
-			irq->pending_latch = false;
-		}
+		// if (irq->hw && vgic_irq_is_sgi(irq->intid)) {
+		// 	irq_set_irqchip_state(irq->host_irq,
+		// 			      IRQCHIP_STATE_PENDING,
+		// 			      irq->pending_latch);
+		// 	irq->pending_latch = false;
+		// }
 
 #ifdef CONFIG_VIRT_VTIMER_IRQ_BYPASS
 		/*
@@ -412,15 +418,17 @@ static int vgic_v3_uaccess_write_pending(struct kvm_vcpu *vcpu,
 		if (irq->vtimer_info) {
 			WARN_ON_ONCE(irq_set_irqchip_state(irq->host_irq,
 						IRQCHIP_STATE_PENDING,
-						irq->pending_latch));
-			irq->pending_latch = false;
+						false));
+			// irq->pending_latch = false;
 		}
 #endif
+		irq->pending_latch = false;
 
-		if (irq->pending_latch)
-			vgic_queue_irq_unlock(vcpu->kvm, irq, flags);
-		else
-			raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+		// if (irq->pending_latch)
+		// 	vgic_queue_irq_unlock(vcpu->kvm, irq, flags);
+		// else
+		raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+		}
 
 		vgic_put_irq(vcpu->kvm, irq);
 	}
@@ -601,16 +609,19 @@ static void vgic_mmio_write_invlpi(struct kvm_vcpu *vcpu,
 	 *
 	 * Also discard the access if LPIs are not enabled.
 	 */
+	pr_info("[gvmdebug] vgic_mmio_write_invlpi vcpu id: %d, addr: 0x%llx, val: 0x%lx\n", vcpu->vcpu_id, (unsigned long long)addr, val);
 	if ((addr & 4) || !vgic_lpis_enabled(vcpu))
 		return;
 
 	intid = lower_32_bits(val);
+	pr_info("[gvmdebug] vgic_mmio_write_invlpi intid: %u\n", intid);
 	if (intid < VGIC_MIN_LPI)
 		return;
 
 	vgic_set_rdist_busy(vcpu, true);
 
 	irq = vgic_get_irq(vcpu->kvm, NULL, intid);
+	pr_info("[gvmdebug] vgic_get_irq for intid: %u, got irq: %p\n", intid, irq);
 	if (irq) {
 		vgic_its_inv_lpi(vcpu->kvm, irq);
 		vgic_put_irq(vcpu->kvm, irq);
@@ -1167,6 +1178,81 @@ static int match_mpidr(u64 sgi_aff, u16 sgi_cpu_mask, struct kvm_vcpu *vcpu)
 	((((reg) & ICC_SGI1R_AFFINITY_## level ##_MASK) \
 	>> ICC_SGI1R_AFFINITY_## level ##_SHIFT) << MPIDR_LEVEL_SHIFT(level))
 
+bool vgic_v3_dispatch_sgi_remote_handle(struct kvm *kvm, int vcpu_id, int sgi, bool allow_group1)
+{
+	struct kvm_vcpu *c_vcpu;
+	struct vgic_irq *irq;
+	int ret = 0;
+	unsigned long flags;
+
+	c_vcpu = kvm_get_vcpu(kvm, vcpu_id);
+	if (!c_vcpu) {
+		pr_err("vgic_v3_dispatch_sgi_remote_handle: invalid vcpu id %d\n", vcpu_id);
+		return false;
+	}
+	
+	irq = vgic_get_irq(kvm, c_vcpu, sgi);
+	if (!irq) {
+		pr_err("vgic_v3_dispatch_sgi_remote_handle: failed to get irq for vcpu id %d, sgi %d\n", vcpu_id, sgi);
+		return false;
+	}
+
+	raw_spin_lock_irqsave(&irq->irq_lock, flags);
+
+	if (!irq->group || allow_group1) {
+		if (!irq->hw) {
+			irq->pending_latch = true;
+			vgic_queue_irq_unlock(kvm, irq, flags);
+		} else {
+			int err;
+			err = irq_set_irqchip_state(irq->host_irq,
+						    IRQCHIP_STATE_PENDING,
+						    true);
+			WARN_RATELIMIT(err, "IRQ %d", irq->host_irq);
+			raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+		}
+	} else {
+		raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+	}
+
+	vgic_put_irq(kvm, irq);
+	return true;
+}
+
+int vgic_v3_dispatch_sgi_remote_req(struct kvm *kvm, int vcpu_id, int sgi, bool allow_group1)
+{
+	int ret;
+	char *buffer;
+
+	typedef struct vgic_v3_dispatch_sgi_params {
+		int vcpu_id;
+		int sgi;
+		bool allow_group1;
+	};
+
+	struct vgic_v3_dispatch_sgi_params params = {
+		.vcpu_id = vcpu_id,
+		.sgi = sgi,
+		.allow_group1 = allow_group1,
+	};
+
+	size_t size = sizeof(struct vgic_v3_dispatch_sgi_params);
+	buffer = kzalloc(size, GFP_KERNEL_ACCOUNT);
+	memcpy(buffer, &params, size);
+	const char* tar_ip = kvm->cluster_iplist[kvm->local_index?0:1];
+	ret = ktcp_send_to_vCpu(tar_ip, kvm, KTCP_CPU_REQ_ID, buffer, size);
+	kfree(buffer);
+	buffer = NULL;
+	return ret;
+}
+
+bool vgic_v3_dispatch_sgi_remote_resp(struct kvm *kvm, char *buffer)
+{
+	printk(KERN_ERR "vgic_v3_dispatch_sgi_remote_resp: received response from remote, buffer: %s\n", buffer);
+	const char* tar_ip = kvm->cluster_iplist[kvm->local_index?0:1];
+	return ktcp_recv_resp(tar_ip, kvm, KTCP_CPU_RESP_ID, buffer);
+}
+
 /**
  * vgic_v3_dispatch_sgi - handle SGI requests from VCPUs
  * @vcpu: The VCPU requesting a SGI
@@ -1205,6 +1291,7 @@ void vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
 	 * if we are already finished. This avoids iterating through all
 	 * VCPUs when most of the times we just signal a single VCPU.
 	 */
+	const char* tar_ip = kvm->cluster_iplist[kvm->local_index?0:1];
 	kvm_for_each_vcpu(c, c_vcpu, kvm) {
 		struct vgic_irq *irq;
 
@@ -1225,6 +1312,19 @@ void vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
 
 			/* remove this matching VCPU from the mask */
 			target_cpus &= ~BIT(level0);
+		}
+
+		// 实现判断远端并转发，传c,sgi,allow_group1
+		// c 是目标 vCPU 的 ID，vcpu_id 是当前发中断的 vCPU ID。
+		// kvm->local_cpus 是每台物理机的 CPU 个数。
+		// 如果除以 local_cpus 的商不一样，说明跨物理机了！
+		if ((c / kvm->local_cpus) != (vcpu_id / kvm->local_cpus)) {
+			// 发现是远端！直接在内核态调用 ktcp 发送请求
+			vgic_v3_dispatch_sgi_remote_req(kvm, c, sgi, allow_group1);
+			char out_buffer[512];
+			ktcp_resv_resp(tar_ip, kvm, 0x6666+vcpu_id, out_buffer);
+
+			continue;
 		}
 
 		irq = vgic_get_irq(vcpu->kvm, c_vcpu, sgi);

@@ -19,6 +19,8 @@
 #define SUCCESS 0
 // How many requests can be buffered in the listening queue
 #define DEFAULT_BACKLOG 16
+#define KTCP_CPU_REQ_ID 0x1234
+#define KTCP_CPU_RESP_ID 0x1235
 
 struct tx_add;
 typedef struct tx_add tx_add_t;

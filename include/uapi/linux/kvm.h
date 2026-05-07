@@ -103,6 +103,7 @@ struct kvm_userspace_memory_region {
 #define KVM_MEM_LOG_DIRTY_PAGES	(1UL << 0)
 #define KVM_MEM_READONLY	(1UL << 1)
 #define KVM_MEM_HUGE_POD	(1UL << 9)
+#define KVM_MEM_DEV_SHARED	(1UL << 10)
 
 /* for KVM_IRQ_LINE */
 struct kvm_irq_level {
@@ -1575,6 +1576,7 @@ struct kvm_numa_info {
  * KVM_CREATE_VCPU receives as a parameter the vcpu slot, and returns
  * a vcpu fd.
  */
+#define KVM_INIT_TIMER            _IO(KVMIO,   0x40)
 #define KVM_CREATE_VCPU           _IO(KVMIO,   0x41)
 #define KVM_GET_DIRTY_LOG         _IOW(KVMIO,  0x42, struct kvm_dirty_log)
 #define KVM_SET_NR_MMU_PAGES      _IO(KVMIO,   0x44)
@@ -1693,7 +1695,7 @@ struct kvm_s390_ucas_mapping {
 #define KVM_ARM_MTE_COPY_TAGS	  _IOR(KVMIO,  0xb4, struct kvm_arm_copy_mte_tags)
 /* Available with KVM_CAP_COUNTER_OFFSET */
 #define KVM_ARM_SET_COUNTER_OFFSET _IOW(KVMIO,  0xb5, struct kvm_arm_counter_offset)
-#define KVM_ARM_GET_REG_WRITABLE_MASKS _IOR(KVMIO,  0xb6, struct reg_mask_range)
+// #define KVM_ARM_GET_REG_WRITABLE_MASKS _IOR(KVMIO,  0xb6, struct reg_mask_range)
 
 /* ioctl for SW vcpu init*/
 #define KVM_SW64_VCPU_INIT	  _IO(KVMIO,  0xba)
@@ -1801,6 +1803,9 @@ struct kvm_s390_ucas_mapping {
 #define KVM_S390_SET_CMMA_BITS      _IOW(KVMIO, 0xb9, struct kvm_s390_cmma_log)
 /* Memory Encryption Commands */
 #define KVM_MEMORY_ENCRYPT_OP      _IOWR(KVMIO, 0xba, unsigned long)
+#define KVM_HANDLE_FORWARD_MES     _IOW(KVMIO, 0xbb, struct kvm_forward_mes)
+#define KVM_CREATE_MSG_FORWARD_EVENTFD _IOW(KVMIO, 0xf0, __u32)
+#define KVM_CREATE_MSG_FORWARD_SHARED_MEM _IOW(KVMIO, 0xf2, __u32)
 
 struct kvm_enc_region {
 	__u64 addr;

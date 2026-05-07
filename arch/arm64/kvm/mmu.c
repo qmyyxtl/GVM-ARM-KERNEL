@@ -1484,8 +1484,8 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 
 	fault_granule = 1UL << ARM64_HW_PGTABLE_LEVEL_SHIFT(fault_level);
 	write_fault = kvm_is_write_fault(vcpu);
-	int dsm_access = kvm_dsm_vcpu_acquire_page(vcpu,&memslot,gfn,write_fault);
-	
+	// int dsm_access = kvm_dsm_vcpu_acquire_page(vcpu,&memslot,gfn,write_fault);
+	// printk("gvmdebug vcpu %d page fault at gpa_addr 0x%llx, gfn 0x%llx, dsm_access %d\n",vcpu->vcpu_id, fault_ipa, fault_ipa >> PAGE_SHIFT, dsm_access);
 
 	/*
 	 * Realms cannot map protected pages read-only
@@ -1575,6 +1575,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 		fault_ipa &= ~(vma_pagesize - 1);
 
 	gfn = kvm_gpa_from_fault(kvm, fault_ipa) >> PAGE_SHIFT;
+
 	mte_allowed = kvm_vma_mte_allowed(vma);
 
 	/* Don't use the VMA after the unlock -- it may have vanished */
@@ -1656,7 +1657,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 			goto out_unlock;
 		}
 	}
-
+	// int dsm_access = kvm_dsm_vcpu_acquire_page(vcpu,&memslot,gfn,write_fault);
 	if (fault_status != ESR_ELx_FSC_PERM && !device && kvm_has_mte(kvm)) {
 		/* Check the VMM hasn't introduced a new disallowed VMA */
 		if (mte_allowed) {
@@ -1711,6 +1712,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 	}
 
 out_unlock:
+	//dsm_release(vcpu,&memslot,gfn);
 	read_unlock(&kvm->mmu_lock);
 	kvm_release_pfn_clean(pfn);
 	return ret != -EAGAIN ? ret : 0;

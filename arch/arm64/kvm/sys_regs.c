@@ -2922,6 +2922,165 @@ static const struct sys_reg_desc sys_reg_descs[] = {
 	EL2_REG(SP_EL2, NULL, reset_unknown, 0),
 };
 
+static inline bool kvm_supported_tlbi_s1e1_op(struct kvm_vcpu *vcpu, u32 instr)
+{
+	struct kvm *kvm = vcpu->kvm;
+	u8 CRm = sys_reg_CRm(instr);
+
+	if (!(sys_reg_Op0(instr) == TLBI_Op0 &&
+	    sys_reg_Op1(instr) == TLBI_Op1_EL1))
+		return false;
+
+	return true;
+}
+
+static void s2_mmu_tlbi_s1e1(struct kvm_s2_mmu *mmu, const union tlbi_info *info)
+{
+	WARN_ON(__kvm_tlbi_s2e2(mmu, info->va.addr, info->va.encoding));
+}
+
+static bool handle_tlbi_el1(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+			   const struct sys_reg_desc *r)
+{
+	u32 sys_encoding = sys_insn(p->Op0, p->Op1, p->CRn, p->CRm, p->Op2);
+
+	/**
+	 * If we're here, this is because we've trapped on a EL1 TLBI 
+	 * instruction that affects the EL1 translation regime while
+	 * we're running in a context that doesn't allow us to let the 
+	 * HW do its thing (aka vEL2):
+	 * 
+	 * - HCR_EL2.E2H == 0 : a non_VHE guest
+	 * - HCR_EL2.{E2H,TGE} == { 1, 0 } : a VHE guest in guest mode
+	 * 
+	 * Another possibility is that we're invalidating the EL2 context
+	 * using EL1 instructions, but that we landed here because we need
+	 * additional invalidation for structures that are not held in the
+	 * CPU TLBs (such as the VNCR pseudo-TLB and its EL2 mapping). In 
+	 * that case, we are guaranteed that HCR_EL2.{E2H,TGE} == { 1, 1 }
+	 * as we don't allow an NV-capable L1 in a nVHE configuration.
+	 * 
+	 * We don't expect these helpers to ever be called when running
+	 * in a cVEL1 context.
+	 * 
+	 */
+
+	 if (!kvm_supported_tlbi_s1e1_op(vcpu, sys_encoding)) {
+		pr_info("kvm not supported tlbi s1e1 op\n");
+		return undef_access(vcpu, p, r);
+	 }
+
+	 if (vcpu_el2_e2h_is_set(vcpu) && vcpu_el2_tge_is_set(vcpu)) {
+		pr_info("enter kvm_handle_s1e1_tlbi\n");
+		return true;
+	 }
+
+	 struct kvm_s2_mmu *mmu = vcpu->arch.hw_mmu;
+	 union tlbi_info tlbi_info;
+	 tlbi_info.va.addr = p->regval;
+	 tlbi_info.va.encoding = sys_encoding;
+	 size_t sz = sizeof(union tlbi_info);
+
+	 const char* tar_ip = vcpu->kvm->cluster_iplist[vcpu->kvm->local_index?0:1];
+	 struct tlbi_request req = {
+		.tlbi_info = tlbi_info,
+		.vcpu_id = vcpu->vcpu_id
+	 };
+	 int ret = ktcp_send_to_vCpu(tar_ip, vcpu->kvm, 0x1234, (const char*)&req, sizeof(req));
+
+	 s2_mmu_tlbi_s1e1(mmu, &tlbi_info);
+
+	 char out_buffer[512];
+	 ret = ktcp_resv_resp(tar_ip, vcpu->kvm, 0x1234, out_buffer);
+
+	 return true;
+}
+
+int handle_tlbi_remote(struct kvm *kvm, union tlbi_info *tlbi_info, int vcpu_id)
+{
+	struct kvm_vcpu *vcpu = kvm_get_vcpu(kvm, vcpu_id);
+	struct kvm_s2_mmu *mmu = vcpu->arch.hw_mmu;
+	s2_mmu_tlbi_s1e1(mmu, tlbi_info);
+	return 0;
+}
+
+static struct sys_reg_desc sys_insn_descs[] = {
+
+	// copy from 6.18.2 of Linux Kernel
+	// Refer to CS.1.4.4 of DQIO487L
+	SYS_INSN(TLBI_VMALLE1OS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAE1OS, handle_tlbi_el1),
+	SYS_INSN(TLBI_ASIDE1OS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAAE1OS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VALE1OS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAALE1OS, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_RVAE1IS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAAE1IS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVALE1IS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAALE1IS, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_VMALLE1IS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAE1IS, handle_tlbi_el1),
+	SYS_INSN(TLBI_ASIDE1IS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAAE1IS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VALE1IS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAALE1IS, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_RVAE1OS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAAE1OS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVALE1OS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAALE1OS, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_RVAE1, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAAE1, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVALE1, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAALE1, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_VMALLE1, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAE1, handle_tlbi_el1),
+	SYS_INSN(TLBI_ASIDE1, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAAE1, handle_tlbi_el1),
+	SYS_INSN(TLBI_VALE1, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAALE1, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_VMALLE1OSNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAE1OSNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_ASIDE1OSNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAAE1OSNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VALE1OSNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAALE1OSNXS, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_RVAE1ISNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAAE1ISNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVALE1ISNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAALE1ISNXS, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_VMALLE1ISNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAE1ISNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_ASIDE1ISNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAAE1ISNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VALE1ISNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAALE1ISNXS, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_RVAE1OSNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAAE1OSNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVALE1OSNXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAALE1OSNXS, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_RVAE1NXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAAE1NXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVALE1NXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_RVAALE1NXS, handle_tlbi_el1),
+
+	SYS_INSN(TLBI_VMALLE1NXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAE1NXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_ASIDE1NXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAAE1NXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VALE1NXS, handle_tlbi_el1),
+	SYS_INSN(TLBI_VAALE1NXS, handle_tlbi_el1),
+};
+
 static const struct sys_reg_desc *first_idreg;
 
 static bool trap_dbgdidr(struct kvm_vcpu *vcpu,
@@ -3609,7 +3768,10 @@ static bool emulate_sys_reg(struct kvm_vcpu *vcpu,
 {
 	const struct sys_reg_desc *r;
 
-	r = find_reg(params, sys_reg_descs, ARRAY_SIZE(sys_reg_descs));
+	if (params->Op0 == 2 || params->Op0 == 3)
+		r = find_reg(params, sys_reg_descs, ARRAY_SIZE(sys_reg_descs));
+	else
+		r = find_reg(params, sys_insn_descs, ARRAY_SIZE(sys_insn_descs));
 
 	if (likely(r)) {
 		perform_access(vcpu, params, r);

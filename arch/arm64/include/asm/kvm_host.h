@@ -81,6 +81,7 @@ enum kvm_mode kvm_get_mode(void);
 static inline enum kvm_mode kvm_get_mode(void) { return KVM_MODE_NONE; };
 #endif
 
+extern unsigned int __ro_after_init_kvm_sve_max_vl;
 int __init kvm_arm_init_sve(void);
 unsigned int kvm_sve_get_max_vl(struct kvm *kvm);
 
@@ -92,6 +93,31 @@ struct kvm_hyp_memcache {
 	phys_addr_t head;
 	unsigned long nr_pages;
 };
+
+union tlbi_info {
+	struct {
+		u64 start;
+		u64 size;
+	} range;
+
+	struct {
+		u64 addr;
+	} ipa;
+
+	struct {
+		u64 addr;
+		u32 encoding;
+	} va;
+
+};
+
+struct tlbi_request {
+	union tlbi_info info;
+	int vcpu_id;
+	char flag[32];
+};
+
+int handle_tlbi_remote(struct kvm *kvm, union tlbi_info *tlb_info, int vcpu_id);
 
 static inline void push_hyp_memcache(struct kvm_hyp_memcache *mc,
 				     phys_addr_t *p,
@@ -701,6 +727,17 @@ struct vcpu_reset_state {
 	bool		reset;
 };
 
+struct vcpu_off_state {
+	unsigned long vcpu_id;
+	u32 type;
+	u64 flags;
+};
+
+struct cpu_on_request {
+	struct vcpu_reset_state reset_state_t;
+	unsigned long cpu_id;
+};
+
 struct kvm_vcpu_arch {
 	struct kvm_cpu_context ctxt;
 
@@ -1147,11 +1184,11 @@ static inline bool __vcpu_write_sys_reg_to_cpu(u64 val, int reg)
 
 struct kvm_vm_stat {
 	struct kvm_vm_stat_generic generic;
-	#if defined(CONFIG_KVM_DSM) & defined(KVM_DSM_PF_PROFILE)
+#if defined(CONFIG_KVM_DSM) & defined(KVM_DSM_PF_PROFILE)
 	ulong total_dsm_pfs;
 	ulong total_tx_bytes;
 	ulong total_tx_latency; /* in us */
-	#endif
+#endif
 };
 
 struct kvm_vcpu_stat {
@@ -1278,6 +1315,25 @@ unsigned long kvm_mmio_read_buf(const void *buf, unsigned int len);
 
 int kvm_handle_mmio_return(struct kvm_vcpu *vcpu);
 int io_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa);
+
+typedef struct mmio_request {
+	int vcpu_id;
+	int bus_idx;
+	phys_addr_t fault_ipa;
+	int len;
+	long data;
+	int is_write_mmio;
+};
+ubsigned long handle_mmio_write(struct kvm *kvm, struct mmio_request *req, int *request);
+
+typedef struct yjc_timer {
+	int vcpu_id;
+	u64 voffset;
+	u64 poffset;
+	char flag[24];
+};
+
+int handle_timer_set(struct kvm *kvm, struct yjc_timer *req);
 
 /*
  * Returns true if a Performance Monitoring Interrupt (PMI), a.k.a. perf event,
@@ -1412,8 +1468,8 @@ int kvm_vm_ioctl_mte_copy_tags(struct kvm *kvm,
 			       struct kvm_arm_copy_mte_tags *copy_tags);
 int kvm_vm_ioctl_set_counter_offset(struct kvm *kvm,
 				    struct kvm_arm_counter_offset *offset);
-int kvm_vm_ioctl_get_reg_writable_masks(struct kvm *kvm,
-					struct reg_mask_range *range);
+// int kvm_vm_ioctl_get_reg_writable_masks(struct kvm *kvm,
+// 					struct reg_mask_range *range);
 
 /* Guest/host FPSIMD coordination helpers */
 int kvm_arch_vcpu_run_map_fp(struct kvm_vcpu *vcpu);
@@ -1478,7 +1534,7 @@ bool kvm_arm_vcpu_is_finalized(struct kvm_vcpu *vcpu);
 #define kvm_vm_has_ran_once(kvm)					\
 	(test_bit(KVM_ARCH_FLAG_HAS_RAN_ONCE, &(kvm)->arch.flags))
 
-#define kvm_vcpu_initialized(v) vcpu_get_flag(vcpu, VCPU_INITIALIZED)
+// #define kvm_vcpu_initialized(v) vcpu_get_flag(vcpu, VCPU_INITIALIZED)
 
 int kvm_trng_call(struct kvm_vcpu *vcpu);
 #ifdef CONFIG_KVM
