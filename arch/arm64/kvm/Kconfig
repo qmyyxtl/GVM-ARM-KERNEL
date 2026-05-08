@@ -77,6 +77,13 @@ config KVM_DSM
 	  Provide support for distributed software memory inside KVM, which allows
 	  userspace to implement distributed hypervisors.
 
+config KVM_DSM_IRQ_FORWARD
+	bool "KVM DSM interrupt forwarding support"
+	depends on KVM 
+	default n
+	help
+	  Provide support for interrupt forwarding in distributed KVM.
+
 config HISI_VIRTCCA_HOST
 	bool "Enable virtcca cvm host feature"
 	depends on KVM

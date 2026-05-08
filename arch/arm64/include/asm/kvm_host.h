@@ -56,6 +56,9 @@
 #define KVM_REQ_RESYNC_PMU_EL0	KVM_ARCH_REQ(7)
 #define KVM_REQ_RELOAD_TLBI_DVMBM	KVM_ARCH_REQ(8)
 #define KVM_REQ_RELOAD_WFI_TRAPS       KVM_ARCH_REQ(9)
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+#define KVM_REQ_DSM_IRQ_FORWARD   KVM_ARCH_REQ(10)
+#endif
 
 #define KVM_DIRTY_LOG_MANUAL_CAPS   (KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE | \
 				     KVM_DIRTY_LOG_INITIALLY_SET)
@@ -770,6 +773,15 @@ struct kvm_vcpu_arch {
 	struct vgic_cpu vgic_cpu;
 	struct arch_timer_cpu timer_cpu;
 	struct kvm_pmu pmu;
+
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	/* DSM interrupt forwarding */
+    bool dsm_irq_forward_pending;
+    u32 dsm_irq_forward_source_id;     
+    u32 dsm_irq_forward_sgi;      
+    u32 dsm_irq_forward_reg;  
+#endif
+
 
 	/*
 	 * Guest registers we preserve during guest debugging.

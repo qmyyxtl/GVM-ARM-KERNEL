@@ -266,6 +266,7 @@ struct kvm_xen_exit {
 #define KVM_EXIT_RISCV_CSR        36
 #define KVM_EXIT_NOTIFY           37
 #define KVM_EXIT_LOONGARCH_IOCSR  38
+#define KVM_EXIT_DSM_SEND_IRQ     40
 
 /* For KVM_EXIT_INTERNAL_ERROR */
 /* Emulate instruction failed. */
@@ -303,6 +304,11 @@ struct kvm_run {
 	__u64 psw_addr; /* psw lower half */
 #endif
 	union {
+		struct {
+			__u32 source_id;
+			__u32 sgi;
+			__u32 reg;
+		} dsm_send_irq;
 		/* KVM_EXIT_UNKNOWN */
 		struct {
 			__u64 hardware_exit_reason;

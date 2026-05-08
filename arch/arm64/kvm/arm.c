@@ -1116,6 +1116,18 @@ static int kvm_vcpu_suspend(struct kvm_vcpu *vcpu)
 static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 {
 	if (kvm_request_pending(vcpu)) {
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+		if (kvm_check_request(KVM_REQ_DSM_IRQ_FORWARD, vcpu)) {
+            vcpu->run->exit_reason = KVM_EXIT_DSM_SEND_IRQ;
+            vcpu->run->dsm_send_irq.source_id = vcpu->vcpu_id;
+            vcpu->run->dsm_send_irq.sgi = vcpu->arch.dsm_irq_forward_sgi;
+            vcpu->run->dsm_send_irq.reg = vcpu->arch.dsm_irq_forward_reg;
+            vcpu->arch.dsm_irq_forward_pending = false;
+			printk(KERN_INFO "kvm: vCPU %u requested DSM IRQ forward to SGI %u\n",
+			       vcpu->vcpu_id, vcpu->arch.dsm_irq_forward_sgi);
+            return 0;   /* 0 表示退出到 userspace（QEMU） */
+        }
+#endif
 		if (kvm_check_request(KVM_REQ_VM_DEAD, vcpu))
 			return -EIO;
 
