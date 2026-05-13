@@ -781,11 +781,15 @@ struct kvm_vcpu_arch {
     int dsm_irq_forward_kind;
     u32 dsm_irq_forward_source_id;    
 	u32 dsm_irq_forward_target_id; 
+	bool dsm_irq_broadcast;
+	/* For PSCI SYSTEM_OFF forwarding */
 	u64 dsm_irq_psci_pc;
 	u64 dsm_irq_psci_r0;
 	bool dsm_irq_psci_be;
-    u32 dsm_irq_forward_sgi;      
-    u32 dsm_irq_forward_reg;  
+	/* For SGI */
+    bool dsm_irq_sgi_allow_group1;  
+	u32 dsm_irq_sgi;    
+	u64 dsm_irq_sgi_reg;
 #endif
 
 

@@ -1119,13 +1119,16 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
 		if (kvm_check_request(KVM_REQ_DSM_IRQ_FORWARD, vcpu)) {
             vcpu->run->exit_reason = KVM_EXIT_DSM_SEND_IRQ;
-            vcpu->run->dsm_send_irq.source_id = vcpu->vcpu_id;
-            vcpu->run->dsm_send_irq.sgi = vcpu->arch.dsm_irq_forward_sgi;
-            vcpu->run->dsm_send_irq.reg = vcpu->arch.dsm_irq_forward_reg;
+            vcpu->run->dsm_send_irq.source_id = vcpu->arch.dsm_irq_forward_source_id;
+			vcpu->run->dsm_send_irq.target_id = vcpu->arch.dsm_irq_forward_target_id;
 			vcpu->run->dsm_send_irq.kind = vcpu->arch.dsm_irq_forward_kind;
-			printk(KERN_INFO "kvm: vCPU %u requested DSM IRQ forward to SGI %u\n",
-			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_forward_sgi);
-            return 0;   /* 0 表示退出到 userspace（QEMU） */
+			vcpu->run->dsm_send_irq.broadcast = vcpu->arch.dsm_irq_broadcast;
+			vcpu->run->dsm_send_irq.sgi = vcpu->arch.dsm_irq_sgi;
+			vcpu->run->dsm_send_irq.sgi_reg = vcpu->arch.dsm_irq_sgi_reg;
+			vcpu->run->dsm_send_irq.allow_group1 = vcpu->arch.dsm_irq_sgi_allow_group1;
+			printk(KERN_INFO "kvm: vCPU %u requested DSM IRQ forward to target vCPU %lx, broadcast: %u, sgi: %u, sgi_reg: 0x%llx, allow_group1: %u\n",
+			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_forward_target_id, vcpu->arch.dsm_irq_broadcast, vcpu->arch.dsm_irq_sgi, vcpu->arch.dsm_irq_sgi_reg, vcpu->arch.dsm_irq_sgi_allow_group1);
+			return 0;   /* 0 表示退出到 userspace（QEMU） */
         }
 		if (kvm_check_request(KVM_REQ_DSM_WAKEUP_FORWARD,vcpu))
 		{
@@ -2085,13 +2088,13 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		struct kvm_vcpu *vcpu = NULL;
 		if (copy_from_user(&params, argp, sizeof(params)))
 			return -EFAULT;
-		vcpu = kvm_get_vcpu(kvm, params.vcpu_id);
+		vcpu = kvm_get_vcpu(kvm, params.source_id);
 		if (!vcpu) {
 			return -EINVAL;
 		} else {
-			// r = kvm_dsm_handle_sgi(vcpu, params.sgi_id);
-			vgic_v3_dispatch_sgi(vcpu, params.sgi, params.reg);
-			// printk(KERN_INFO "kvm-dsm: received SGI %d for vCPU %d reg %d\n", params.sgi, params.vcpu_id, params.reg);
+			printk("SGI from vCPU %d with reg 0x%llx, allow_group1: %d\n", params.source_id, params.sgi_reg, params.allow_group);
+			vgic_v3_dispatch_sgi(vcpu,params.sgi_reg,params.allow_group);
+			printk("SGI dispatched already\n");
 			return 0;
 		}
 	}

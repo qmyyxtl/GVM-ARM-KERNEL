@@ -16,6 +16,7 @@
 #include <linux/mm.h>
 #include <linux/printk.h>
 #include <linux/uaccess.h>
+#include <linux/irqchip/arm-gic-v3.h>
 
 #include <asm/actlr.h>
 #include <asm/cacheflush.h>
@@ -355,11 +356,15 @@ static bool access_gic_sgi(struct kvm_vcpu *vcpu,
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
 	vgic_v3_dispatch_sgi(vcpu, p->regval, g1);
 	vcpu->arch.dsm_irq_forward_kind = 1;
-	vcpu->arch.dsm_irq_forward_sgi = g1;
-	vcpu->arch.dsm_irq_forward_reg = p->regval;
+	vcpu->arch.dsm_irq_sgi_reg = p->regval;
+	vcpu->arch.dsm_irq_sgi = (p->regval & ICC_SGI1R_SGI_ID_MASK) >> ICC_SGI1R_SGI_ID_SHIFT;
+	vcpu->arch.dsm_irq_sgi_allow_group1 = g1;
+	vcpu->arch.dsm_irq_forward_target_id = (p->regval & ICC_SGI1R_TARGET_LIST_MASK) >> ICC_SGI1R_TARGET_LIST_SHIFT;
 	vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
-	printk(KERN_DEBUG "Forwarding SGI to DSM: vCPU%d reg=0x%08x g1=%d\n",
-	       vcpu->vcpu_id, p->regval, g1);
+	vcpu->arch.dsm_irq_broadcast = p->regval & BIT_ULL(ICC_SGI1R_IRQ_ROUTING_MODE_BIT);
+	printk(KERN_INFO "Forwarding SGI %u from vCPU %u to target list 0x%x (allow_group1=%u)\n",
+	       vcpu->arch.dsm_irq_sgi, vcpu->arch.dsm_irq_forward_source_id,
+	       vcpu->arch.dsm_irq_forward_target_id, vcpu->arch.dsm_irq_sgi_allow_group1);
 	kvm_make_request(KVM_REQ_DSM_IRQ_FORWARD, vcpu);
 	return true;
 #endif

@@ -1292,3 +1292,38 @@ int vgic_v3_line_level_info_uaccess(struct kvm_vcpu *vcpu, bool is_write,
 
 	return 0;
 }
+
+void vgic_v3_dispatch_sgi_remote(struct kvm_vcpu *vcpu, u32 sgi, bool allow_group1)
+{
+	struct vgic_irq *irq;
+	unsigned long flags;
+	struct kvm *kvm = vcpu->kvm;
+
+	
+	irq = vgic_get_irq(kvm, vcpu, sgi);
+	if (!irq) {
+		pr_err("vgic_v3_dispatch_sgi_remote_handle: failed to get irq for vcpu id %d, sgi %d\n", vcpu->vcpu_id, sgi);
+		return;
+	}
+
+	raw_spin_lock_irqsave(&irq->irq_lock, flags);
+
+	if (!irq->group || allow_group1) {
+		if (!irq->hw) {
+			irq->pending_latch = true;
+			vgic_queue_irq_unlock(kvm, irq, flags);
+		} else {
+			int err;
+			err = irq_set_irqchip_state(irq->host_irq,
+						    IRQCHIP_STATE_PENDING,
+						    true);
+			WARN_RATELIMIT(err, "IRQ %d", irq->host_irq);
+			raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+		}
+	} else {
+		raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+	}
+
+	vgic_put_irq(kvm, irq);
+	return;
+}
