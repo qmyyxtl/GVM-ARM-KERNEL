@@ -293,7 +293,20 @@ static int kvm_psci_0_2_call(struct kvm_vcpu *vcpu)
 		kvm_psci_narrow_to_32bit(vcpu);
 		fallthrough;
 	case PSCI_0_2_FN64_CPU_ON:
+		printk(KERN_INFO "kvm: PSCI_0_2_FN_CPU_ON called for vCPU %u by vCPU %u\n",
+		       smccc_get_arg1(vcpu), vcpu->vcpu_id);
 		val = kvm_psci_vcpu_on(vcpu);
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+		vcpu->arch.dsm_irq_forward_kind = 2;
+		vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
+		vcpu->arch.dsm_irq_forward_target_id = smccc_get_arg1(vcpu);
+		vcpu->arch.dsm_irq_psci_pc = smccc_get_arg2(vcpu);
+		vcpu->arch.dsm_irq_psci_r0 = smccc_get_arg3(vcpu);
+		vcpu->arch.dsm_irq_psci_be = kvm_vcpu_is_be(vcpu);
+		printk(KERN_INFO "kvm: DSM IRQ forward set by PSCI CPU_ON for source vCPU %u target vCPU %u\n",
+		       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_forward_target_id);
+		kvm_make_request(KVM_REQ_DSM_WAKEUP_FORWARD, vcpu);
+#endif
 		break;
 	case PSCI_0_2_FN_AFFINITY_INFO:
 		kvm_psci_narrow_to_32bit(vcpu);
@@ -441,6 +454,8 @@ static int kvm_psci_0_1_call(struct kvm_vcpu *vcpu)
 		val = PSCI_RET_SUCCESS;
 		break;
 	case KVM_PSCI_FN_CPU_ON:
+		printk(KERN_INFO "kvm: PSCI_FN_CPU_ON called for vCPU %u by vCPU %u\n",
+		       smccc_get_arg1(vcpu), vcpu->vcpu_id);
 		val = kvm_psci_vcpu_on(vcpu);
 		break;
 	default:
@@ -492,4 +507,48 @@ int kvm_psci_call(struct kvm_vcpu *vcpu)
 		smccc_set_retval(vcpu, SMCCC_RET_NOT_SUPPORTED, 0, 0, 0);
 		return 1;
 	}
+}
+int kvm_psci_vcpu_on_by_remote(struct kvm_vcpu *vcpu, unsigned long	pc,	unsigned long r0, bool be)
+{
+	int ret = PSCI_RET_SUCCESS;
+	struct vcpu_reset_state *reset_state;
+	if (!vcpu) {
+		printk(KERN_ERR "Invalid CPU\n");
+		return PSCI_RET_INVALID_PARAMS;
+	}
+	spin_lock(&vcpu->arch.mp_state_lock);
+
+	if (!kvm_arm_vcpu_stopped(vcpu)) {
+		printk(KERN_ERR "CPU is not in stopped state\n");
+		ret = PSCI_RET_ALREADY_ON;
+		goto out_unlock;
+	}
+	reset_state = &vcpu->arch.reset_state;
+	reset_state->pc = pc;
+
+	/* Propagate caller endianness */
+	reset_state->be = be;
+	/*
+	 * NOTE: We always update r0 (or x0) because for PSCI v0.1
+	 * the general purpose registers are undefined upon CPU_ON.
+	 */
+	reset_state->r0 = r0;
+
+	reset_state->reset = true;
+	kvm_make_request(KVM_REQ_VCPU_RESET, vcpu);
+
+	/*
+	 * Make sure the reset request is observed if the RUNNABLE mp_state is
+	 * observed.
+	 */
+	smp_wmb();
+
+	WRITE_ONCE(vcpu->arch.mp_state.mp_state, KVM_MP_STATE_RUNNABLE);
+	bool wake_up;
+	wake_up = kvm_vcpu_wake_up(vcpu);
+	pr_info("kvm_vcpu_wake_up ret = %d\n", wake_up);
+
+out_unlock:
+	spin_unlock(&vcpu->arch.mp_state_lock);
+	return ret;
 }

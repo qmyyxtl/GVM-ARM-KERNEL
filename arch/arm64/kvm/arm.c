@@ -1122,11 +1122,26 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
             vcpu->run->dsm_send_irq.source_id = vcpu->vcpu_id;
             vcpu->run->dsm_send_irq.sgi = vcpu->arch.dsm_irq_forward_sgi;
             vcpu->run->dsm_send_irq.reg = vcpu->arch.dsm_irq_forward_reg;
-            vcpu->arch.dsm_irq_forward_pending = false;
+			vcpu->run->dsm_send_irq.kind = vcpu->arch.dsm_irq_forward_kind;
 			printk(KERN_INFO "kvm: vCPU %u requested DSM IRQ forward to SGI %u\n",
-			       vcpu->vcpu_id, vcpu->arch.dsm_irq_forward_sgi);
+			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_forward_sgi);
             return 0;   /* 0 表示退出到 userspace（QEMU） */
         }
+		if (kvm_check_request(KVM_REQ_DSM_WAKEUP_FORWARD,vcpu))
+		{
+			vcpu->run->exit_reason = KVM_EXIT_DSM_SEND_IRQ;
+			vcpu->run->dsm_send_irq.source_id = vcpu->arch.dsm_irq_forward_source_id;
+			vcpu->run->dsm_send_irq.target_id = vcpu->arch.dsm_irq_forward_target_id;
+			vcpu->run->dsm_send_irq.kind = vcpu->arch.dsm_irq_forward_kind;
+			vcpu->run->dsm_send_irq.pc = vcpu->arch.dsm_irq_psci_pc;
+			vcpu->run->dsm_send_irq.r0 = vcpu->arch.dsm_irq_psci_r0;
+			vcpu->run->dsm_send_irq.be = vcpu->arch.dsm_irq_psci_be;
+			printk(KERN_INFO "kvm: vCPU %u requested DSM wakeup forward to target vCPU, pc: 0x%llx, r0: 0x%llx, be: %u\n",
+			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_psci_pc,
+			       vcpu->arch.dsm_irq_psci_r0, vcpu->arch.dsm_irq_psci_be);
+			return 0;
+		}
+		
 #endif
 		if (kvm_check_request(KVM_REQ_VM_DEAD, vcpu))
 			return -EIO;
@@ -2063,6 +2078,38 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 	struct kvm_device_attr attr;
 
 	switch (ioctl) {
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	case KVM_DSM_SGI: {
+		// printk("kvm_vm_ioctl_dsm KVM_DSM_SGI\n");
+		struct kvm_sgi_params params;
+		struct kvm_vcpu *vcpu = NULL;
+		if (copy_from_user(&params, argp, sizeof(params)))
+			return -EFAULT;
+		vcpu = kvm_get_vcpu(kvm, params.vcpu_id);
+		if (!vcpu) {
+			return -EINVAL;
+		} else {
+			// r = kvm_dsm_handle_sgi(vcpu, params.sgi_id);
+			vgic_v3_dispatch_sgi(vcpu, params.sgi, params.reg);
+			// printk(KERN_INFO "kvm-dsm: received SGI %d for vCPU %d reg %d\n", params.sgi, params.vcpu_id, params.reg);
+			return 0;
+		}
+	}
+	case KVM_DSM_PSCI_ON: {
+		// printk("kvm_vm_ioctl_dsm KVM_DSM_PSCI_ON\n");
+		struct kvm_psci_on_params params;
+		struct kvm_vcpu *vcpu = NULL;
+		if (copy_from_user(&params, argp, sizeof(params)))
+			return -EFAULT;
+		vcpu = kvm_get_vcpu(kvm, params.target_id);
+		printk(KERN_INFO "kvm-dsm: PSCI CPU_ON for target vCPU %d pc 0x%llx r0 0x%llx be %d\n",
+		       params.target_id, params.pc, params.r0, params.be);
+		kvm_psci_vcpu_on_by_remote(vcpu,params.pc, params.r0, params.be);
+		return 0;
+	}
+
+#endif
+
 #ifdef CONFIG_HISI_VIRTCCA_HOST
 	case KVM_LOAD_USER_DATA: {
 		return kvm_load_user_data(kvm, arg);

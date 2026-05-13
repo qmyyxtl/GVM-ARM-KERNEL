@@ -306,8 +306,13 @@ struct kvm_run {
 	union {
 		struct {
 			__u32 source_id;
+			__u32 target_id;
 			__u32 sgi;
 			__u32 reg;
+			__u32 kind;
+			__u64 pc;
+			__u64 r0;
+			bool be;
 		} dsm_send_irq;
 		/* KVM_EXIT_UNKNOWN */
 		struct {
@@ -1277,7 +1282,21 @@ struct kvm_dsm_mempin {
 
 #define KVM_DSM_PGSIZE            (4 * 1024)
 
+struct kvm_sgi_params {
+	int vcpu_id;
+	__u32 sgi;
+	__u32 reg;
+};
+#define KVM_DSM_SGI               _IOW(KVMIO, 0xf6, struct kvm_sgi_params)
 
+struct kvm_psci_on_params {
+	__u32 source_id;
+	__u32 target_id;
+	__u64 pc;
+	__u64 r0;
+	bool be;
+};
+#define KVM_DSM_PSCI_ON           _IOW(KVMIO, 0xf7, struct kvm_psci_on_params)
 
 
 struct kvm_irq_routing_irqchip {

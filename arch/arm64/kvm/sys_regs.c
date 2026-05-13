@@ -354,7 +354,7 @@ static bool access_gic_sgi(struct kvm_vcpu *vcpu,
 
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
 	vgic_v3_dispatch_sgi(vcpu, p->regval, g1);
-	vcpu->arch.dsm_irq_forward_pending = true;
+	vcpu->arch.dsm_irq_forward_kind = 1;
 	vcpu->arch.dsm_irq_forward_sgi = g1;
 	vcpu->arch.dsm_irq_forward_reg = p->regval;
 	vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;

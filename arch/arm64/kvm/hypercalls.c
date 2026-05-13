@@ -412,6 +412,7 @@ int kvm_smccc_call_handler(struct kvm_vcpu *vcpu)
 	case ARM_SMCCC_TRNG_RND64:
 		return kvm_trng_call(vcpu);
 	default:
+		printk(KERN_WARNING "kvm: Unhandled SMCCC function ID: 0x%08x\n", func_id);
 		return kvm_psci_call(vcpu);
 	}
 

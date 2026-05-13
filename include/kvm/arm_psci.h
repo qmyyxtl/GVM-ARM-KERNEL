@@ -40,5 +40,7 @@ static inline int kvm_psci_version(struct kvm_vcpu *vcpu)
 
 
 int kvm_psci_call(struct kvm_vcpu *vcpu);
+int kvm_psci_vcpu_on_by_remote(struct kvm_vcpu *vcpu, unsigned long	pc,	unsigned long r0, bool be);
+
 
 #endif /* __KVM_ARM_PSCI_H__ */
