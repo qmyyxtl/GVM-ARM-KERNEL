@@ -2088,12 +2088,14 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		struct kvm_vcpu *vcpu = NULL;
 		if (copy_from_user(&params, argp, sizeof(params)))
 			return -EFAULT;
-		vcpu = kvm_get_vcpu(kvm, params.source_id);
+		vcpu = kvm_get_vcpu(kvm, params.target_id);
 		if (!vcpu) {
 			return -EINVAL;
 		} else {
-			printk("SGI from vCPU %d with reg 0x%llx, allow_group1: %d\n", params.source_id, params.sgi_reg, params.allow_group);
-			vgic_v3_dispatch_sgi(vcpu,params.sgi_reg,params.allow_group);
+			// vgic_v3_dispatch_sgi(vcpu,params.sgi_reg,params.allow_group);
+			printk(KERN_INFO "kvm-dsm: SGI for target vCPU %d sgi 0x%x allow_group %d\n",
+			       params.target_id, params.sgi, params.allow_group);
+			vgic_v3_dispatch_sgi_remote(vcpu, params.sgi, params.allow_group);
 			printk("SGI dispatched already\n");
 			return 0;
 		}

@@ -66,8 +66,10 @@ static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
 	unsigned long cpu_id;
 
 	cpu_id = smccc_get_arg1(source_vcpu);
-	if (!kvm_psci_valid_affinity(source_vcpu, cpu_id))
+	if (!kvm_psci_valid_affinity(source_vcpu, cpu_id)) {
+		printk(KERN_ERR "PSCI_ON: valid_affinity=%d\n", kvm_psci_valid_affinity(source_vcpu, cpu_id));
 		return PSCI_RET_INVALID_PARAMS;
+	}
 
 	vcpu = kvm_mpidr_to_vcpu(kvm, cpu_id);
 
@@ -75,8 +77,10 @@ static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
 	 * Make sure the caller requested a valid CPU and that the CPU is
 	 * turned off.
 	 */
-	if (!vcpu)
+	if (!vcpu) {
+		printk(KERN_ERR "PSCI_ON: target_vcpu_id=%u not found\n", cpu_id);
 		return PSCI_RET_INVALID_PARAMS;
+	}
 
 	spin_lock(&vcpu->arch.mp_state_lock);
 	if (!kvm_arm_vcpu_stopped(vcpu)) {
@@ -84,7 +88,10 @@ static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
 			ret = PSCI_RET_ALREADY_ON;
 		else
 			ret = PSCI_RET_INVALID_PARAMS;
-
+		printk(KERN_ERR "PSCI_ON: target_vcpu_id=%u mp_state=%d stopped=%d\n",
+             vcpu->vcpu_id,
+             READ_ONCE(vcpu->arch.mp_state.mp_state),
+             kvm_arm_vcpu_stopped(vcpu));
 		goto out_unlock;
 	}
 
@@ -121,11 +128,11 @@ static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
 
 out_unlock:
 	spin_unlock(&vcpu->arch.mp_state_lock);
-	if (vcpu_is_rec(vcpu) && ret != PSCI_RET_SUCCESS) {
-		realm_psci_complete(source_vcpu, vcpu,
-				    ret == PSCI_RET_ALREADY_ON ?
-				    PSCI_RET_SUCCESS : PSCI_RET_DENIED);
-	}
+	// if (vcpu_is_rec(vcpu) && ret != PSCI_RET_SUCCESS) {
+	// 	realm_psci_complete(source_vcpu, vcpu,
+	// 			    ret == PSCI_RET_ALREADY_ON ?
+	// 			    PSCI_RET_SUCCESS : PSCI_RET_DENIED);
+	// }
 	return ret;
 }
 
