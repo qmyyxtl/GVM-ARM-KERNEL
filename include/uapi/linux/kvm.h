@@ -315,6 +315,9 @@ struct kvm_run {
 			__u32 sgi;
 			__u64 sgi_reg;
 			bool allow_group1;
+			__u64 mmio_gpa;
+			__u32 mmio_len;
+			__u64 mmio_val;
 		} dsm_send_irq;
 		/* KVM_EXIT_UNKNOWN */
 		struct {
@@ -1302,6 +1305,13 @@ struct kvm_psci_on_params {
 };
 #define KVM_DSM_PSCI_ON           _IOW(KVMIO, 0xf7, struct kvm_psci_on_params)
 
+struct kvm_vgic3_mmio_params {
+	__u32 vcpu_id;
+	__u64 addr;
+	__u32 len;
+	__u64 data;
+};
+#define KVM_DSM_VGIC3_MMIO        _IOW(KVMIO, 0xf8, struct kvm_vgic3_mmio_params)
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;

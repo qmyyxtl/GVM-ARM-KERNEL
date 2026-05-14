@@ -1144,6 +1144,19 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 			       vcpu->arch.dsm_irq_psci_r0, vcpu->arch.dsm_irq_psci_be);
 			return 0;
 		}
+		if (kvm_check_request(KVM_REQ_DSM_MMIO_FORWARD,vcpu))
+		{
+			vcpu->run->exit_reason = KVM_EXIT_DSM_SEND_IRQ;
+			vcpu->run->dsm_send_irq.source_id = vcpu->arch.dsm_irq_forward_source_id;
+			vcpu->run->dsm_send_irq.kind = vcpu->arch.dsm_irq_forward_kind;
+			vcpu->run->dsm_send_irq.mmio_gpa = vcpu->arch.dsm_mmio_gpa;
+			vcpu->run->dsm_send_irq.mmio_len = vcpu->arch.dsm_mmio_len;
+			vcpu->run->dsm_send_irq.mmio_val = vcpu->arch.dsm_mmio_val;
+			printk(KERN_INFO "kvm: vCPU %u requested DSM MMIO forward, gpa: 0x%llx, len: %u, val: 0x%llx\n",
+			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_mmio_gpa,
+			       vcpu->arch.dsm_mmio_len, vcpu->arch.dsm_mmio_val);
+			return 0;
+		}
 		
 #endif
 		if (kvm_check_request(KVM_REQ_VM_DEAD, vcpu))
@@ -2090,13 +2103,20 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 			return -EFAULT;
 		vcpu = kvm_get_vcpu(kvm, params.target_id);
 		if (!vcpu) {
+			printk(KERN_ERR "GVM KVM_DSM_SGI: source=%u target=%u sgi=%u allow_group=%u sgi_reg=0x%llx no target vCPU\n",
+			       params.source_id, params.target_id, params.sgi,
+			       params.allow_group, params.sgi_reg);
 			return -EINVAL;
 		} else {
 			// vgic_v3_dispatch_sgi(vcpu,params.sgi_reg,params.allow_group);
-			printk(KERN_INFO "kvm-dsm: SGI for target vCPU %d sgi 0x%x allow_group %d\n",
-			       params.target_id, params.sgi, params.allow_group);
+			printk(KERN_INFO "GVM KVM_DSM_SGI: source=%u target=%u vcpu_id=%u mp_state=%d sgi=%u allow_group=%u sgi_reg=0x%llx\n",
+			       params.source_id, params.target_id, vcpu->vcpu_id,
+			       READ_ONCE(vcpu->arch.mp_state.mp_state), params.sgi,
+			       params.allow_group, params.sgi_reg);
 			vgic_v3_dispatch_sgi_remote(vcpu, params.sgi, params.allow_group);
-			printk("SGI dispatched already\n");
+			printk(KERN_INFO "GVM KVM_DSM_SGI: dispatch returned target=%u vcpu_id=%u sgi=%u mp_state=%d\n",
+			       params.target_id, vcpu->vcpu_id, params.sgi,
+			       READ_ONCE(vcpu->arch.mp_state.mp_state));
 			return 0;
 		}
 	}
@@ -2110,6 +2130,18 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		printk(KERN_INFO "kvm-dsm: PSCI CPU_ON for target vCPU %d pc 0x%llx r0 0x%llx be %d\n",
 		       params.target_id, params.pc, params.r0, params.be);
 		kvm_psci_vcpu_on_by_remote(vcpu,params.pc, params.r0, params.be);
+		return 0;
+	}
+	case KVM_DSM_VGIC3_MMIO: {
+		// printk("kvm_vm_ioctl_dsm KVM_DSM_PSCI_ON\n");
+		struct kvm_vgic3_mmio_params params;
+		struct kvm_vcpu *vcpu = NULL;
+		if (copy_from_user(&params, argp, sizeof(params)))
+			return -EFAULT;
+		vcpu = kvm_get_vcpu(kvm, params.vcpu_id);
+		printk(KERN_INFO "kvm-dsm: VGIC3 MMIO for target vCPU %d addr 0x%llx len %u data 0x%llx\n",
+		       params.vcpu_id, params.addr, params.len, params.data);
+		kvm_vgic3_mmio_write(vcpu, params.addr, params.len, params.data);
 		return 0;
 	}
 

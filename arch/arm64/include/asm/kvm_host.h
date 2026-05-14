@@ -59,6 +59,7 @@
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
 #define KVM_REQ_DSM_IRQ_FORWARD   KVM_ARCH_REQ(10)
 #define KVM_REQ_DSM_WAKEUP_FORWARD   KVM_ARCH_REQ(11)
+#define KVM_REQ_DSM_MMIO_FORWARD   KVM_ARCH_REQ(12)
 //#define KVM_REQ_DSM_PSCI_OFF_FORWARD   KVM_ARCH_REQ(12)
 #endif
 
@@ -790,6 +791,10 @@ struct kvm_vcpu_arch {
     bool dsm_irq_sgi_allow_group1;  
 	u32 dsm_irq_sgi;    
 	u64 dsm_irq_sgi_reg;
+	/* For vgci mmio forwarding */
+	u64 dsm_mmio_gpa;
+	u32 dsm_mmio_len;
+	u64 dsm_mmio_val;
 #endif
 
 

@@ -358,7 +358,18 @@ bool vgic_queue_irq_unlock(struct kvm *kvm, struct vgic_irq *irq,
 
 retry:
 	vcpu = vgic_target_oracle(irq);
+	if (irq->intid < 16)
+		pr_info("GVM vgic queue: intid=%u enabled=%u pending=%u active=%u group=%u irq_vcpu=%p irq_vcpu_id=%d target_vcpu=%p target_vcpu_id=%d oracle_vcpu=%p oracle_vcpu_id=%d\n",
+			irq->intid, irq->enabled, irq_is_pending(irq), irq->active, irq->group,
+			irq->vcpu, irq->vcpu ? irq->vcpu->vcpu_id : -1,
+			irq->target_vcpu, irq->target_vcpu ? irq->target_vcpu->vcpu_id : -1,
+			vcpu, vcpu ? vcpu->vcpu_id : -1);
 	if (irq->vcpu || !vcpu) {
+		if (irq->intid < 16)
+			pr_info("GVM vgic queue: return false intid=%u reason=%s irq_vcpu_id=%d oracle_vcpu_id=%d\n",
+				irq->intid, irq->vcpu ? "already-on-ap-list" : "no-oracle-target",
+				irq->vcpu ? irq->vcpu->vcpu_id : -1,
+				vcpu ? vcpu->vcpu_id : -1);
 		/*
 		 * If this IRQ is already on a VCPU's ap_list, then it
 		 * cannot be moved or modified and there is no more work for
@@ -410,6 +421,13 @@ retry:
 	 */
 
 	if (unlikely(irq->vcpu || vcpu != vgic_target_oracle(irq))) {
+		struct kvm_vcpu *new_vcpu = vgic_target_oracle(irq);
+
+		if (irq->intid < 16)
+			pr_info("GVM vgic queue: retry intid=%u old_oracle=%d new_oracle=%d irq_vcpu_id=%d\n",
+				irq->intid, vcpu ? vcpu->vcpu_id : -1,
+				new_vcpu ? new_vcpu->vcpu_id : -1,
+				irq->vcpu ? irq->vcpu->vcpu_id : -1);
 		raw_spin_unlock(&irq->irq_lock);
 		raw_spin_unlock_irqrestore(&vcpu->arch.vgic_cpu.ap_list_lock,
 					   flags);
@@ -425,6 +443,9 @@ retry:
 	vgic_get_irq_kref(irq);
 	list_add_tail(&irq->ap_list, &vcpu->arch.vgic_cpu.ap_list_head);
 	irq->vcpu = vcpu;
+	if (irq->intid < 16)
+		pr_info("GVM vgic queue: inserted intid=%u target_vcpu=%u pending=%u enabled=%u\n",
+			irq->intid, vcpu->vcpu_id, irq_is_pending(irq), irq->enabled);
 
 	raw_spin_unlock(&irq->irq_lock);
 	raw_spin_unlock_irqrestore(&vcpu->arch.vgic_cpu.ap_list_lock, flags);

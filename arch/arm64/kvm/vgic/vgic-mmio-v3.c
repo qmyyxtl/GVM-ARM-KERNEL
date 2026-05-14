@@ -113,6 +113,16 @@ static void vgic_mmio_write_v3_misc(struct kvm_vcpu *vcpu,
 				    gpa_t addr, unsigned int len,
 				    unsigned long val)
 {
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	vcpu->arch.dsm_irq_forward_kind = 3;
+	vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
+	vcpu->arch.dsm_mmio_gpa = addr;
+	vcpu->arch.dsm_mmio_len = len;
+	vcpu->arch.dsm_mmio_val = val;
+	printk(KERN_INFO "kvm: DSM IRQ forward set by VGIC MMIO write for source vCPU %u addr=0x%llx len=%u val=0x%llx\n",
+	       vcpu->arch.dsm_irq_forward_source_id, addr, len, val);
+	kvm_make_request(KVM_REQ_DSM_MMIO_FORWARD, vcpu);
+#endif
 	struct vgic_dist *dist = &vcpu->kvm->arch.vgic;
 
 	switch (addr & 0x0c) {
@@ -1302,28 +1312,88 @@ void vgic_v3_dispatch_sgi_remote(struct kvm_vcpu *vcpu, u32 sgi, bool allow_grou
 	
 	irq = vgic_get_irq(kvm, vcpu, sgi);
 	if (!irq) {
-		pr_err("vgic_v3_dispatch_sgi_remote_handle: failed to get irq for vcpu id %d, sgi %d\n", vcpu->vcpu_id, sgi);
+		pr_err("GVM vgic remote SGI: failed to get irq vcpu=%u sgi=%u allow_group1=%u\n",
+		       vcpu->vcpu_id, sgi, allow_group1);
 		return;
 	}
 
 	raw_spin_lock_irqsave(&irq->irq_lock, flags);
+	pr_info("GVM vgic remote SGI: target_vcpu=%u sgi=%u intid=%u group=%u allow_group1=%u enabled=%u hw=%u pending_before=%u active=%u irq_vcpu=%p\n",
+		vcpu->vcpu_id, sgi, irq->intid, irq->group, allow_group1,
+		irq->enabled, irq->hw, irq->pending_latch, irq->active, irq->vcpu);
 
 	if (!irq->group || allow_group1) {
 		if (!irq->hw) {
+			bool queued;
+
 			irq->pending_latch = true;
-			vgic_queue_irq_unlock(kvm, irq, flags);
+			queued = vgic_queue_irq_unlock(kvm, irq, flags);
+			pr_info("GVM vgic remote SGI: queued target_vcpu=%u sgi=%u queued=%u\n",
+				vcpu->vcpu_id, sgi, queued);
 		} else {
 			int err;
 			err = irq_set_irqchip_state(irq->host_irq,
 						    IRQCHIP_STATE_PENDING,
 						    true);
+			pr_info("GVM vgic remote SGI: hw target_vcpu=%u sgi=%u host_irq=%u err=%d\n",
+				vcpu->vcpu_id, sgi, irq->host_irq, err);
 			WARN_RATELIMIT(err, "IRQ %d", irq->host_irq);
 			raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
 		}
 	} else {
+		pr_info("GVM vgic remote SGI: dropped by group target_vcpu=%u sgi=%u group=%u allow_group1=%u\n",
+			vcpu->vcpu_id, sgi, irq->group, allow_group1);
 		raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
 	}
 
 	vgic_put_irq(kvm, irq);
 	return;
+}
+
+void kvm_vgic3_mmio_write(struct kvm_vcpu *vcpu, gpa_t addr, unsigned int len,
+			   unsigned long val)
+{
+	struct vgic_dist *dist = &vcpu->kvm->arch.vgic;
+
+	switch (addr & 0x0c) {
+	case GICD_CTLR: {
+		bool was_enabled, is_hwsgi;
+
+		mutex_lock(&vcpu->kvm->arch.config_lock);
+
+		was_enabled = dist->enabled;
+		is_hwsgi = dist->nassgireq;
+
+		dist->enabled = val & GICD_CTLR_ENABLE_SS_G1;
+
+		/* Not a GICv4.1? No HW SGIs */
+		if (!kvm_vgic_global_state.has_gicv4_1 || !gic_cpuif_has_vsgi())
+			val &= ~GICD_CTLR_nASSGIreq;
+
+		/* Dist stays enabled? nASSGIreq is RO */
+		if (was_enabled && dist->enabled) {
+			val &= ~GICD_CTLR_nASSGIreq;
+			val |= FIELD_PREP(GICD_CTLR_nASSGIreq, is_hwsgi);
+		}
+
+		/* Switching HW SGIs? */
+		dist->nassgireq = val & GICD_CTLR_nASSGIreq;
+		if (is_hwsgi != dist->nassgireq)
+			vgic_v4_configure_vsgis(vcpu->kvm);
+
+		if (kvm_vgic_global_state.has_gicv4_1 &&
+		    was_enabled != dist->enabled)
+			kvm_make_all_cpus_request(vcpu->kvm, KVM_REQ_RELOAD_GICv4);
+		else if (!was_enabled && dist->enabled)
+			vgic_kick_vcpus(vcpu->kvm);
+
+		mutex_unlock(&vcpu->kvm->arch.config_lock);
+		break;
+	}
+	case GICD_TYPER:
+	case GICD_TYPER2:
+	case GICD_IIDR:
+		/* This is at best for documentation purposes... */
+		return;
+	}
 }
