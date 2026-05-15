@@ -318,6 +318,8 @@ struct kvm_run {
 			__u64 mmio_gpa;
 			__u32 mmio_len;
 			__u64 mmio_val;
+			__u32 spi_irq_num;
+			bool spi_irq_level;
 		} dsm_send_irq;
 		/* KVM_EXIT_UNKNOWN */
 		struct {
@@ -1312,6 +1314,18 @@ struct kvm_vgic3_mmio_params {
 	__u64 data;
 };
 #define KVM_DSM_VGIC3_MMIO        _IOW(KVMIO, 0xf8, struct kvm_vgic3_mmio_params)
+
+struct kvm_spi_params {
+	__u32 source_id;
+	__u32 spi_irq_num;
+	bool spi_irq_level;
+};
+#define KVM_DSM_SPI               _IOW(KVMIO, 0xf9, struct kvm_spi_params)
+
+struct kvm_dsm_io_forwarding_params {
+	__u32 dsm_index;
+};
+#define KVM_DSM_IO_FORWARDING     _IOW(KVMIO, 0xfa, struct kvm_dsm_io_forwarding_params)
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;

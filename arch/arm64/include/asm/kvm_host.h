@@ -60,6 +60,7 @@
 #define KVM_REQ_DSM_IRQ_FORWARD   KVM_ARCH_REQ(10)
 #define KVM_REQ_DSM_WAKEUP_FORWARD   KVM_ARCH_REQ(11)
 #define KVM_REQ_DSM_MMIO_FORWARD   KVM_ARCH_REQ(12)
+#define KVM_REQ_DSM_SPI_FORWARD   KVM_ARCH_REQ(13)
 //#define KVM_REQ_DSM_PSCI_OFF_FORWARD   KVM_ARCH_REQ(12)
 #endif
 
@@ -459,6 +460,9 @@ struct kvm_arch {
 	atomic_t pts;
 #endif /* TARDIS_KVM_DSM */
 
+#elif defined(CONFIG_KVM_DSM_IRQ_FORWARD)
+	int dsm_id;
+
 #endif /* CONFIG_KVM_DSM */
 
 #ifdef CONFIG_KVM_HISI_VIRT
@@ -795,6 +799,9 @@ struct kvm_vcpu_arch {
 	u64 dsm_mmio_gpa;
 	u32 dsm_mmio_len;
 	u64 dsm_mmio_val;
+	/* For SPI forwarding */
+	u32 dsm_spi_irq_num;
+	bool dsm_spi_irq_level;
 #endif
 
 

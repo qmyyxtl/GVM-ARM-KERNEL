@@ -1157,7 +1157,17 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 			       vcpu->arch.dsm_mmio_len, vcpu->arch.dsm_mmio_val);
 			return 0;
 		}
-		
+		if (kvm_check_request(KVM_REQ_DSM_SPI_FORWARD,vcpu))
+		{
+			vcpu->run->exit_reason = KVM_EXIT_DSM_SEND_IRQ;
+			vcpu->run->dsm_send_irq.source_id = vcpu->arch.dsm_irq_forward_source_id;
+			vcpu->run->dsm_send_irq.kind = vcpu->arch.dsm_irq_forward_kind;
+			vcpu->run->dsm_send_irq.spi_irq_num = vcpu->arch.dsm_spi_irq_num;
+			vcpu->run->dsm_send_irq.spi_irq_level = vcpu->arch.dsm_spi_irq_level;
+			printk(KERN_INFO "kvm: vCPU %u requested DSM SPI IRQ forward, irq_num: %u, level: %u\n",
+			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_spi_irq_num, vcpu->arch.dsm_spi_irq_level);
+			return 0;
+		}
 #endif
 		if (kvm_check_request(KVM_REQ_VM_DEAD, vcpu))
 			return -EIO;
@@ -2095,6 +2105,15 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 
 	switch (ioctl) {
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	case KVM_DSM_IO_FORWARDING:{
+		struct kvm_dsm_io_forwarding_params params;
+		if (copy_from_user(&params, argp, sizeof(params)))
+			return -EFAULT;
+		kvm->arch.dsm_id = params.dsm_index;
+		return 0;
+	}
+
+
 	case KVM_DSM_SGI: {
 		// printk("kvm_vm_ioctl_dsm KVM_DSM_SGI\n");
 		struct kvm_sgi_params params;
@@ -2143,6 +2162,12 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		       params.vcpu_id, params.addr, params.len, params.data);
 		kvm_vgic3_mmio_write(vcpu, params.addr, params.len, params.data);
 		return 0;
+	}
+	case KVM_DSM_SPI: {
+		struct kvm_spi_params params;
+		if (copy_from_user(&params, argp, sizeof(params)))
+			return -EFAULT;
+		return kvm_vgic_inject_irq(kvm, 0, params.spi_irq_num, params.spi_irq_level, NULL);
 	}
 
 #endif
