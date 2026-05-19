@@ -1324,6 +1324,7 @@ struct kvm_spi_params {
 
 struct kvm_dsm_io_forwarding_params {
 	__u32 dsm_index;
+	__u32 local_cpu_num;
 };
 #define KVM_DSM_IO_FORWARDING     _IOW(KVMIO, 0xfa, struct kvm_dsm_io_forwarding_params)
 

@@ -462,6 +462,7 @@ struct kvm_arch {
 
 #elif defined(CONFIG_KVM_DSM_IRQ_FORWARD)
 	int dsm_id;
+	int local_cpu_num;
 
 #endif /* CONFIG_KVM_DSM */
 

@@ -354,7 +354,9 @@ static bool access_gic_sgi(struct kvm_vcpu *vcpu,
 	}
 
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
-	vgic_v3_dispatch_sgi(vcpu, p->regval, g1);
+	bool has_remote = vgic_v3_dispatch_sgi(vcpu, p->regval, g1);
+	if (!has_remote)
+  		return true;
 	vcpu->arch.dsm_irq_forward_kind = 1;
 	vcpu->arch.dsm_irq_sgi_reg = p->regval;
 	vcpu->arch.dsm_irq_sgi = (p->regval & ICC_SGI1R_SGI_ID_MASK) >> ICC_SGI1R_SGI_ID_SHIFT;

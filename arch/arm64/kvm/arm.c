@@ -2116,6 +2116,7 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		if (copy_from_user(&params, argp, sizeof(params)))
 			return -EFAULT;
 		kvm->arch.dsm_id = params.dsm_index;
+		kvm->arch.local_cpu_num = params.local_cpu_num;
 		return 0;
 	}
 

@@ -1182,7 +1182,7 @@ static int match_mpidr(u64 sgi_aff, u16 sgi_cpu_mask, struct kvm_vcpu *vcpu)
  * check for matching ones. If this bit is set, we signal all, but not the
  * calling VCPU.
  */
-void vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
+bool vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
 {
 	struct kvm *kvm = vcpu->kvm;
 	struct kvm_vcpu *c_vcpu;
@@ -1192,6 +1192,17 @@ void vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
 	int vcpu_id = vcpu->vcpu_id;
 	bool broadcast;
 	unsigned long c, flags;
+
+	
+
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	u32 local_start = 0, local_end = 0;
+	bool has_remote = false;
+  	if (kvm->arch.local_cpu_num) {
+  		local_start = kvm->arch.dsm_id * kvm->arch.local_cpu_num;
+  		local_end = local_start + kvm->arch.local_cpu_num;
+  	}
+#endif
 
 	sgi = (reg & ICC_SGI1R_SGI_ID_MASK) >> ICC_SGI1R_SGI_ID_SHIFT;
 	broadcast = reg & BIT_ULL(ICC_SGI1R_IRQ_ROUTING_MODE_BIT);
@@ -1238,6 +1249,10 @@ void vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
 		 * generate interrupts of either group.
 		 */
 		if (!irq->group || allow_group1) {
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+  			if (kvm->arch.local_cpu_num && (c_vcpu->vcpu_id < local_start || c_vcpu->vcpu_id >= local_end) )
+  				has_remote = true;
+#endif
 			if (!irq->hw) {
 				irq->pending_latch = true;
 				vgic_queue_irq_unlock(vcpu->kvm, irq, flags);
@@ -1256,6 +1271,10 @@ void vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
 
 		vgic_put_irq(vcpu->kvm, irq);
 	}
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	return has_remote;
+#endif
+	return false;
 }
 
 int vgic_v3_dist_uaccess(struct kvm_vcpu *vcpu, bool is_write,

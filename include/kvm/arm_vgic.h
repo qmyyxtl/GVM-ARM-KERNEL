@@ -480,7 +480,7 @@ void kvm_vgic_sync_hwstate(struct kvm_vcpu *vcpu);
 void kvm_vgic_flush_hwstate(struct kvm_vcpu *vcpu);
 void kvm_vgic_reset_mapped_irq(struct kvm_vcpu *vcpu, u32 vintid);
 
-void vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1);
+bool vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1);
 void vgic_v3_dispatch_sgi_remote(struct kvm_vcpu *vcpu, u32 sgi, bool allow_group1);
 void kvm_vgic3_mmio_write(struct kvm_vcpu *vcpu, gpa_t addr, unsigned int len, unsigned long val);
 
