@@ -1118,6 +1118,16 @@ static int dispatch_mmio_write(struct kvm_vcpu *vcpu, struct kvm_io_device *dev,
 		break;
 	case IODEV_DIST:
 		region->write(vcpu, addr, len, data);
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	vcpu->arch.dsm_irq_forward_kind = 3;
+	vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
+	vcpu->arch.dsm_mmio_gpa = addr;
+	vcpu->arch.dsm_mmio_len = len;
+	vcpu->arch.dsm_mmio_val = data;
+	printk(KERN_INFO "kvm: DSM IRQ forward set by VGIC MMIO write for source vCPU %u addr=0x%llx len=%u val=0x%llx\n",
+	       vcpu->arch.dsm_irq_forward_source_id, addr, len, data);
+	kvm_make_request(KVM_REQ_DSM_MMIO_FORWARD, vcpu);
+#endif
 		break;
 	case IODEV_REDIST:
 		region->write(iodev->redist_vcpu, addr, len, data);
@@ -1158,4 +1168,18 @@ int vgic_register_dist_iodev(struct kvm *kvm, gpa_t dist_base_address,
 
 	return kvm_io_bus_register_dev(kvm, KVM_MMIO_BUS, dist_base_address,
 				       len, &io_device->dev);
+}
+
+int kvm_dsm_vgic_mmio_write(struct kvm *kvm, gpa_t addr, int len, unsigned long data)
+{
+	struct kvm_vcpu *vcpu = kvm_get_vcpu(kvm, 0);
+	struct vgic_io_device *iodev = &kvm->arch.vgic.dist_iodev;
+	const struct vgic_register_region *region;
+
+	region = vgic_get_mmio_region(vcpu, iodev, addr, len);
+	if (!region)
+		return -EINVAL;
+
+	region->write(vcpu, addr, len, data);
+	return 0;
 }

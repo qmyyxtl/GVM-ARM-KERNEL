@@ -46,6 +46,7 @@
 #include <kvm/arm_hypercalls.h>
 #include <kvm/arm_pmu.h>
 #include <kvm/arm_psci.h>
+#include "vgic/vgic.h"
 #ifdef CONFIG_KVM_DSM
 #include "dsm.h"
 #endif
@@ -1624,6 +1625,11 @@ int kvm_vm_ioctl_irq_line(struct kvm *kvm, struct kvm_irq_level *irq_level,
 		if (irq_num < VGIC_NR_PRIVATE_IRQS)
 			return -EINVAL;
 
+		if (irq_num == 79)
+			pr_info("GVM vgic79 irq_line dsm=%d vcpu_idx=%u irq_num=%u level=%d online_vcpus=%d dist_enabled=%d\n",
+				kvm->arch.dsm_id, vcpu_idx, irq_num, level, nrcpus,
+				kvm->arch.vgic.enabled);
+
 		return kvm_vgic_inject_irq(kvm, 0, irq_num, level, NULL);
 	}
 
@@ -2157,10 +2163,10 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		struct kvm_vcpu *vcpu = NULL;
 		if (copy_from_user(&params, argp, sizeof(params)))
 			return -EFAULT;
-		vcpu = kvm_get_vcpu(kvm, params.vcpu_id);
 		printk(KERN_INFO "kvm-dsm: VGIC3 MMIO for target vCPU %d addr 0x%llx len %u data 0x%llx\n",
 		       params.vcpu_id, params.addr, params.len, params.data);
-		kvm_vgic3_mmio_write(vcpu, params.addr, params.len, params.data);
+		// kvm_vgic3_mmio_write(vcpu, params.addr, params.len, params.data);
+		kvm_dsm_vgic_mmio_write(kvm, params.addr, params.len, params.data);
 		return 0;
 	}
 	case KVM_DSM_SPI: {

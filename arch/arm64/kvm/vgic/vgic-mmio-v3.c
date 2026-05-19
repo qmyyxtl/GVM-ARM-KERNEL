@@ -113,16 +113,7 @@ static void vgic_mmio_write_v3_misc(struct kvm_vcpu *vcpu,
 				    gpa_t addr, unsigned int len,
 				    unsigned long val)
 {
-#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
-	vcpu->arch.dsm_irq_forward_kind = 3;
-	vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
-	vcpu->arch.dsm_mmio_gpa = addr;
-	vcpu->arch.dsm_mmio_len = len;
-	vcpu->arch.dsm_mmio_val = val;
-	printk(KERN_INFO "kvm: DSM IRQ forward set by VGIC MMIO write for source vCPU %u addr=0x%llx len=%u val=0x%llx\n",
-	       vcpu->arch.dsm_irq_forward_source_id, addr, len, val);
-	kvm_make_request(KVM_REQ_DSM_MMIO_FORWARD, vcpu);
-#endif
+
 	struct vgic_dist *dist = &vcpu->kvm->arch.vgic;
 
 	switch (addr & 0x0c) {

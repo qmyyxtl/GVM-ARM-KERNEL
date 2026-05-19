@@ -228,8 +228,22 @@ static struct kvm_vcpu *vgic_target_oracle(struct vgic_irq *irq)
 	lockdep_assert_held(&irq->irq_lock);
 
 	/* If the interrupt is active, it must stay on the current vcpu */
-	if (irq->active)
+	if (irq->active) {
+		if (irq->intid == 79) {
+			struct kvm_vcpu *ret = irq->vcpu ? : irq->target_vcpu;
+			struct kvm *kvm = ret ? ret->kvm : NULL;
+
+			pr_info("GVM vgic79 oracle active dsm=%d dist_enabled=%d enabled=%u pending=%u active=%u line=%u latch=%u irq_vcpu=%d target=%d ret=%d\n",
+				kvm ? kvm->arch.dsm_id : -1,
+				kvm ? kvm->arch.vgic.enabled : -1,
+				irq->enabled, irq_is_pending(irq), irq->active,
+				irq->line_level, irq->pending_latch,
+				irq->vcpu ? irq->vcpu->vcpu_id : -1,
+				irq->target_vcpu ? irq->target_vcpu->vcpu_id : -1,
+				ret ? ret->vcpu_id : -1);
+		}
 		return irq->vcpu ? : irq->target_vcpu;
+	}
 
 	/*
 	 * If the IRQ is not active but enabled and pending, we should direct
@@ -239,15 +253,43 @@ static struct kvm_vcpu *vgic_target_oracle(struct vgic_irq *irq)
 	 */
 	if (irq->enabled && irq_is_pending(irq)) {
 		if (unlikely(irq->target_vcpu &&
-			     !irq->target_vcpu->kvm->arch.vgic.enabled))
+			     !irq->target_vcpu->kvm->arch.vgic.enabled)) {
+			if (irq->intid == 79)
+				pr_info("GVM vgic79 oracle blocked dsm=%d dist_enabled=0 enabled=%u pending=%u active=%u line=%u latch=%u target=%d\n",
+					irq->target_vcpu->kvm->arch.dsm_id,
+					irq->enabled, irq_is_pending(irq), irq->active,
+					irq->line_level, irq->pending_latch,
+					irq->target_vcpu->vcpu_id);
 			return NULL;
+		}
 
+		if (irq->intid == 79)
+			pr_info("GVM vgic79 oracle target dsm=%d dist_enabled=%d enabled=%u pending=%u active=%u line=%u latch=%u target=%d group=%u prio=%u config=%d\n",
+				irq->target_vcpu ? irq->target_vcpu->kvm->arch.dsm_id : -1,
+				irq->target_vcpu ? irq->target_vcpu->kvm->arch.vgic.enabled : -1,
+				irq->enabled, irq_is_pending(irq), irq->active,
+				irq->line_level, irq->pending_latch,
+				irq->target_vcpu ? irq->target_vcpu->vcpu_id : -1,
+				irq->group, irq->priority, irq->config);
 		return irq->target_vcpu;
 	}
 
 	/* If neither active nor pending and enabled, then this IRQ should not
 	 * be queued to any VCPU.
 	 */
+	if (irq->intid == 79) {
+		struct kvm *kvm = irq->target_vcpu ? irq->target_vcpu->kvm :
+				  (irq->vcpu ? irq->vcpu->kvm : NULL);
+
+		pr_info("GVM vgic79 oracle none dsm=%d dist_enabled=%d enabled=%u pending=%u active=%u line=%u latch=%u irq_vcpu=%d target=%d group=%u prio=%u config=%d\n",
+			kvm ? kvm->arch.dsm_id : -1,
+			kvm ? kvm->arch.vgic.enabled : -1,
+			irq->enabled, irq_is_pending(irq), irq->active,
+			irq->line_level, irq->pending_latch,
+			irq->vcpu ? irq->vcpu->vcpu_id : -1,
+			irq->target_vcpu ? irq->target_vcpu->vcpu_id : -1,
+			irq->group, irq->priority, irq->config);
+	}
 	return NULL;
 }
 
@@ -358,6 +400,15 @@ bool vgic_queue_irq_unlock(struct kvm *kvm, struct vgic_irq *irq,
 
 retry:
 	vcpu = vgic_target_oracle(irq);
+	if (irq->intid == 79)
+		pr_info("GVM vgic79 queue enter dsm=%d dist_enabled=%d enabled=%u pending=%u active=%u line=%u latch=%u irq_vcpu=%d target=%d oracle=%d group=%u prio=%u config=%d\n",
+			kvm->arch.dsm_id, kvm->arch.vgic.enabled, irq->enabled,
+			irq_is_pending(irq), irq->active, irq->line_level,
+			irq->pending_latch,
+			irq->vcpu ? irq->vcpu->vcpu_id : -1,
+			irq->target_vcpu ? irq->target_vcpu->vcpu_id : -1,
+			vcpu ? vcpu->vcpu_id : -1, irq->group,
+			irq->priority, irq->config);
 	if (irq->intid < 16)
 		pr_info("GVM vgic queue: intid=%u enabled=%u pending=%u active=%u group=%u irq_vcpu=%p irq_vcpu_id=%d target_vcpu=%p target_vcpu_id=%d oracle_vcpu=%p oracle_vcpu_id=%d\n",
 			irq->intid, irq->enabled, irq_is_pending(irq), irq->active, irq->group,
@@ -365,6 +416,15 @@ retry:
 			irq->target_vcpu, irq->target_vcpu ? irq->target_vcpu->vcpu_id : -1,
 			vcpu, vcpu ? vcpu->vcpu_id : -1);
 	if (irq->vcpu || !vcpu) {
+		if (irq->intid == 79)
+			pr_info("GVM vgic79 queue false dsm=%d reason=%s irq_vcpu=%d oracle=%d enabled=%u pending=%u active=%u line=%u latch=%u target=%d\n",
+				kvm->arch.dsm_id,
+				irq->vcpu ? "already-on-ap-list" : "no-oracle-target",
+				irq->vcpu ? irq->vcpu->vcpu_id : -1,
+				vcpu ? vcpu->vcpu_id : -1, irq->enabled,
+				irq_is_pending(irq), irq->active, irq->line_level,
+				irq->pending_latch,
+				irq->target_vcpu ? irq->target_vcpu->vcpu_id : -1);
 		if (irq->intid < 16)
 			pr_info("GVM vgic queue: return false intid=%u reason=%s irq_vcpu_id=%d oracle_vcpu_id=%d\n",
 				irq->intid, irq->vcpu ? "already-on-ap-list" : "no-oracle-target",
@@ -423,6 +483,13 @@ retry:
 	if (unlikely(irq->vcpu || vcpu != vgic_target_oracle(irq))) {
 		struct kvm_vcpu *new_vcpu = vgic_target_oracle(irq);
 
+		if (irq->intid == 79)
+			pr_info("GVM vgic79 queue retry dsm=%d old_oracle=%d new_oracle=%d irq_vcpu=%d enabled=%u pending=%u active=%u line=%u latch=%u\n",
+				kvm->arch.dsm_id, vcpu ? vcpu->vcpu_id : -1,
+				new_vcpu ? new_vcpu->vcpu_id : -1,
+				irq->vcpu ? irq->vcpu->vcpu_id : -1,
+				irq->enabled, irq_is_pending(irq), irq->active,
+				irq->line_level, irq->pending_latch);
 		if (irq->intid < 16)
 			pr_info("GVM vgic queue: retry intid=%u old_oracle=%d new_oracle=%d irq_vcpu_id=%d\n",
 				irq->intid, vcpu ? vcpu->vcpu_id : -1,
@@ -443,6 +510,11 @@ retry:
 	vgic_get_irq_kref(irq);
 	list_add_tail(&irq->ap_list, &vcpu->arch.vgic_cpu.ap_list_head);
 	irq->vcpu = vcpu;
+	if (irq->intid == 79)
+		pr_info("GVM vgic79 queue inserted dsm=%d target=%u enabled=%u pending=%u active=%u line=%u latch=%u dist_enabled=%d\n",
+			kvm->arch.dsm_id, vcpu->vcpu_id, irq->enabled,
+			irq_is_pending(irq), irq->active, irq->line_level,
+			irq->pending_latch, kvm->arch.vgic.enabled);
 	if (irq->intid < 16)
 		pr_info("GVM vgic queue: inserted intid=%u target_vcpu=%u pending=%u enabled=%u\n",
 			irq->intid, vcpu->vcpu_id, irq_is_pending(irq), irq->enabled);
@@ -496,8 +568,22 @@ int kvm_vgic_inject_irq(struct kvm *kvm, int cpuid, unsigned int intid,
 		return -EINVAL;
 
 	raw_spin_lock_irqsave(&irq->irq_lock, flags);
+	if (intid == 79)
+		pr_info("GVM vgic79 inject enter dsm=%d cpuid=%d level=%d owner=%p dist_enabled=%d nr_spis=%u enabled=%u pending=%u active=%u line=%u latch=%u irq_vcpu=%d target=%d group=%u prio=%u config=%d\n",
+			kvm->arch.dsm_id, cpuid, level, owner,
+			kvm->arch.vgic.enabled, kvm->arch.vgic.nr_spis,
+			irq->enabled, irq_is_pending(irq), irq->active,
+			irq->line_level, irq->pending_latch,
+			irq->vcpu ? irq->vcpu->vcpu_id : -1,
+			irq->target_vcpu ? irq->target_vcpu->vcpu_id : -1,
+			irq->group, irq->priority, irq->config);
 
 	if (!vgic_validate_injection(irq, level, owner)) {
+		if (intid == 79)
+			pr_info("GVM vgic79 inject ignored dsm=%d level=%d owner=%p irq_owner=%p config=%d line=%u latch=%u enabled=%u pending=%u active=%u\n",
+				kvm->arch.dsm_id, level, owner, irq->owner,
+				irq->config, irq->line_level, irq->pending_latch,
+				irq->enabled, irq_is_pending(irq), irq->active);
 		/* Nothing to see here, move along... */
 		raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
 		vgic_put_irq(kvm, irq);
@@ -508,6 +594,12 @@ int kvm_vgic_inject_irq(struct kvm *kvm, int cpuid, unsigned int intid,
 		irq->line_level = level;
 	else
 		irq->pending_latch = true;
+	if (intid == 79)
+		pr_info("GVM vgic79 inject pending-set dsm=%d level=%d enabled=%u pending=%u active=%u line=%u latch=%u target=%d\n",
+			kvm->arch.dsm_id, level, irq->enabled,
+			irq_is_pending(irq), irq->active, irq->line_level,
+			irq->pending_latch,
+			irq->target_vcpu ? irq->target_vcpu->vcpu_id : -1);
 
 	vgic_queue_irq_unlock(kvm, irq, flags);
 	vgic_put_irq(kvm, irq);

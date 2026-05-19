@@ -300,18 +300,23 @@ static int kvm_psci_0_2_call(struct kvm_vcpu *vcpu)
 		kvm_psci_narrow_to_32bit(vcpu);
 		fallthrough;
 	case PSCI_0_2_FN64_CPU_ON:
-		printk(KERN_INFO "kvm: PSCI_0_2_FN_CPU_ON called for vCPU %u by vCPU %u\n",
-		       smccc_get_arg1(vcpu), vcpu->vcpu_id);
+		
+		unsigned long target_mpdir = smccc_get_arg1(vcpu);
+		struct kvm_vcpu *target_vcpu;
+		target_vcpu = kvm_mpidr_to_vcpu(vcpu->kvm, target_mpdir);
+		
 		val = kvm_psci_vcpu_on(vcpu);
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
 		vcpu->arch.dsm_irq_forward_kind = 2;
 		vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
-		vcpu->arch.dsm_irq_forward_target_id = smccc_get_arg1(vcpu);
+		vcpu->arch.dsm_irq_forward_target_id = target_vcpu->vcpu_id;
 		vcpu->arch.dsm_irq_psci_pc = smccc_get_arg2(vcpu);
 		vcpu->arch.dsm_irq_psci_r0 = smccc_get_arg3(vcpu);
 		vcpu->arch.dsm_irq_psci_be = kvm_vcpu_is_be(vcpu);
 		printk(KERN_INFO "kvm: DSM IRQ forward set by PSCI CPU_ON for source vCPU %u target vCPU %u\n",
 		       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_forward_target_id);
+		printk(KERN_INFO "kvm: PSCI_0_2_FN_CPU_ON called for vCPU %u by vCPU %u\n",
+		       target_vcpu->vcpu_id, vcpu->vcpu_id);
 		kvm_make_request(KVM_REQ_DSM_WAKEUP_FORWARD, vcpu);
 #endif
 		break;
