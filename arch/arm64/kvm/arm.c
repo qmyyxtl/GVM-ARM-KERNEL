@@ -2127,6 +2127,12 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		struct kvm_vcpu *vcpu = NULL;
 		if (copy_from_user(&params, argp, sizeof(params)))
 			return -EFAULT;
+		if (params.target_id == (u32)-1) {
+			vgic_v3_dispatch_sgi_remote_batch(kvm, params.source_id,
+							  params.sgi_reg,
+							  params.allow_group);
+			return 0;
+		}
 		vcpu = kvm_get_vcpu(kvm, params.target_id);
 		if (!vcpu) {
 			printk(KERN_ERR "GVM KVM_DSM_SGI: source=%u target=%u sgi=%u allow_group=%u sgi_reg=0x%llx no target vCPU\n",

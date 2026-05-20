@@ -1360,6 +1360,81 @@ void vgic_v3_dispatch_sgi_remote(struct kvm_vcpu *vcpu, u32 sgi, bool allow_grou
 	return;
 }
 
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+void vgic_v3_dispatch_sgi_remote_batch(struct kvm *kvm, u32 source_id,
+				       u64 reg, bool allow_group1)
+{
+	struct kvm_vcpu *c_vcpu;
+	u16 target_cpus;
+	u64 mpidr;
+	int sgi;
+	bool broadcast;
+	unsigned long c, flags;
+	u32 local_start = 0, local_end = 0;
+
+	if (kvm->arch.local_cpu_num) {
+		local_start = kvm->arch.dsm_id * kvm->arch.local_cpu_num;
+		local_end = local_start + kvm->arch.local_cpu_num;
+	}
+
+	sgi = (reg & ICC_SGI1R_SGI_ID_MASK) >> ICC_SGI1R_SGI_ID_SHIFT;
+	broadcast = reg & BIT_ULL(ICC_SGI1R_IRQ_ROUTING_MODE_BIT);
+	target_cpus = (reg & ICC_SGI1R_TARGET_LIST_MASK) >> ICC_SGI1R_TARGET_LIST_SHIFT;
+	mpidr = SGI_AFFINITY_LEVEL(reg, 3);
+	mpidr |= SGI_AFFINITY_LEVEL(reg, 2);
+	mpidr |= SGI_AFFINITY_LEVEL(reg, 1);
+
+	kvm_for_each_vcpu(c, c_vcpu, kvm) {
+		struct vgic_irq *irq;
+
+		if (kvm->arch.local_cpu_num &&
+		    (c_vcpu->vcpu_id < local_start || c_vcpu->vcpu_id >= local_end))
+			continue;
+
+		if (!broadcast && target_cpus == 0)
+			break;
+
+		if (broadcast && c_vcpu->vcpu_id == source_id)
+			continue;
+
+		if (!broadcast) {
+			int level0;
+
+			level0 = match_mpidr(mpidr, target_cpus, c_vcpu);
+			if (level0 == -1)
+				continue;
+
+			target_cpus &= ~BIT(level0);
+		}
+
+		irq = vgic_get_irq(kvm, c_vcpu, sgi);
+		if (!irq)
+			continue;
+
+		raw_spin_lock_irqsave(&irq->irq_lock, flags);
+
+		if (!irq->group || allow_group1) {
+			if (!irq->hw) {
+				irq->pending_latch = true;
+				vgic_queue_irq_unlock(kvm, irq, flags);
+			} else {
+				int err;
+
+				err = irq_set_irqchip_state(irq->host_irq,
+							    IRQCHIP_STATE_PENDING,
+							    true);
+				WARN_RATELIMIT(err, "IRQ %d", irq->host_irq);
+				raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+			}
+		} else {
+			raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+		}
+
+		vgic_put_irq(kvm, irq);
+	}
+}
+#endif
+
 void kvm_vgic3_mmio_write(struct kvm_vcpu *vcpu, gpa_t addr, unsigned int len,
 			   unsigned long val)
 {
