@@ -847,6 +847,7 @@ out_unlock:
 #else
 static int bringup_cpu(unsigned int cpu)
 {
+	printk("bringup_cpu(%u)\n", cpu);
 	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
 	struct task_struct *idle = idle_thread_get(cpu);
 	int ret;
@@ -1820,6 +1821,8 @@ static inline const struct cpumask *cpuhp_get_primary_thread_mask(void)
  */
 static bool __init cpuhp_bringup_cpus_parallel(unsigned int ncpus)
 {
+	printk(KERN_INFO "CPU hotplug parallel bringup: %s\n",
+	       __cpuhp_parallel_bringup ? "enabled" : "disabled");
 	const struct cpumask *mask = cpu_present_mask;
 
 	if (__cpuhp_parallel_bringup)

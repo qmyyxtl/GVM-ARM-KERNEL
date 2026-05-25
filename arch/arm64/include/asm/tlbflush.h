@@ -14,8 +14,23 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/mmu_notifier.h>
+#include <linux/arm-smccc.h>
 #include <asm/cputype.h>
 #include <asm/mmu.h>
+
+#define ARM_SMCCC_GVM_DSM_TLBI_SYNC					\
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, ARM_SMCCC_SMC_64,	\
+			   ARM_SMCCC_OWNER_VENDOR_HYP, 0x100)
+
+static __always_inline void gvm_dsm_tlbi_sync(unsigned long start,
+					      unsigned long end,
+					      unsigned long reason)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_hvc(ARM_SMCCC_GVM_DSM_TLBI_SYNC,
+			  start, end, reason, 0, 0, 0, 0, &res);
+}
 
 /*
  * Raw TLBI operations.
@@ -240,6 +255,7 @@ static inline void local_flush_tlb_all(void)
 	__tlbi(vmalle1);
 	dsb(nsh);
 	isb();
+	gvm_dsm_tlbi_sync(0, -1UL, 1);
 }
 
 static inline void flush_tlb_all(void)
@@ -248,6 +264,7 @@ static inline void flush_tlb_all(void)
 	__tlbi(vmalle1is);
 	dsb(ish);
 	isb();
+	gvm_dsm_tlbi_sync(0, -1UL, 2);
 }
 
 static inline void flush_tlb_mm(struct mm_struct *mm)
@@ -260,6 +277,7 @@ static inline void flush_tlb_mm(struct mm_struct *mm)
 	__tlbi_user(aside1is, asid);
 	dsb(ish);
 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, 0, -1UL);
+	gvm_dsm_tlbi_sync(0, -1UL, 3);
 }
 
 static inline void __flush_tlb_page_nosync(struct mm_struct *mm,
@@ -286,6 +304,8 @@ static inline void flush_tlb_page(struct vm_area_struct *vma,
 {
 	flush_tlb_page_nosync(vma, uaddr);
 	dsb(ish);
+	gvm_dsm_tlbi_sync(uaddr & PAGE_MASK,
+			  (uaddr & PAGE_MASK) + PAGE_SIZE, 4);
 }
 
 static inline bool arch_tlbbatch_should_defer(struct mm_struct *mm)
@@ -311,6 +331,7 @@ static inline bool arch_tlbbatch_should_defer(struct mm_struct *mm)
 static inline void arch_flush_tlb_batched_pending(struct mm_struct *mm)
 {
 	dsb(ish);
+	gvm_dsm_tlbi_sync(0, -1UL, 5);
 }
 
 /*
@@ -326,6 +347,7 @@ static inline void arch_flush_tlb_batched_pending(struct mm_struct *mm)
 static inline void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
 {
 	dsb(ish);
+	gvm_dsm_tlbi_sync(0, -1UL, 6);
 }
 
 /*
@@ -449,6 +471,7 @@ static inline void __flush_tlb_range(struct vm_area_struct *vma,
 	__flush_tlb_range_nosync(vma->vm_mm, start, end, stride,
 				 last_level, tlb_level);
 	dsb(ish);
+	gvm_dsm_tlbi_sync(start, end, 7);
 }
 
 static inline void flush_tlb_range(struct vm_area_struct *vma,
@@ -480,6 +503,7 @@ static inline void flush_tlb_kernel_range(unsigned long start, unsigned long end
 	__flush_tlb_range_op(vaale1is, start, pages, stride, 0, 0, false);
 	dsb(ish);
 	isb();
+	gvm_dsm_tlbi_sync(start, end, 8);
 }
 
 /*
@@ -494,6 +518,7 @@ static inline void __flush_tlb_kernel_pgtable(unsigned long kaddr)
 	__tlbi(vaae1is, addr);
 	dsb(ish);
 	isb();
+	gvm_dsm_tlbi_sync(kaddr, kaddr + PAGE_SIZE, 9);
 }
 
 static inline void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
