@@ -313,10 +313,12 @@ static int kvm_psci_0_2_call(struct kvm_vcpu *vcpu)
 		vcpu->arch.dsm_irq_psci_pc = smccc_get_arg2(vcpu);
 		vcpu->arch.dsm_irq_psci_r0 = smccc_get_arg3(vcpu);
 		vcpu->arch.dsm_irq_psci_be = kvm_vcpu_is_be(vcpu);
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 		printk(KERN_INFO "kvm: DSM IRQ forward set by PSCI CPU_ON for source vCPU %u target vCPU %u\n",
 		       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_forward_target_id);
 		printk(KERN_INFO "kvm: PSCI_0_2_FN_CPU_ON called for vCPU %u by vCPU %u\n",
 		       target_vcpu->vcpu_id, vcpu->vcpu_id);
+#endif
 		kvm_make_request(KVM_REQ_DSM_WAKEUP_FORWARD, vcpu);
 #endif
 		break;
@@ -558,7 +560,9 @@ int kvm_psci_vcpu_on_by_remote(struct kvm_vcpu *vcpu, unsigned long	pc,	unsigned
 	WRITE_ONCE(vcpu->arch.mp_state.mp_state, KVM_MP_STATE_RUNNABLE);
 	bool wake_up;
 	wake_up = kvm_vcpu_wake_up(vcpu);
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 	pr_info("kvm_vcpu_wake_up ret = %d\n", wake_up);
+#endif
 
 out_unlock:
 	spin_unlock(&vcpu->arch.mp_state_lock);

@@ -1184,6 +1184,9 @@ static int match_mpidr(u64 sgi_aff, u16 sgi_cpu_mask, struct kvm_vcpu *vcpu)
  */
 bool vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
 {
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	u64 gvm_perf_start_ns = gvm_kvm_perf_now_ns();
+#endif
 	struct kvm *kvm = vcpu->kvm;
 	struct kvm_vcpu *c_vcpu;
 	u16 target_cpus;
@@ -1272,6 +1275,8 @@ bool vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
 		vgic_put_irq(vcpu->kvm, irq);
 	}
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	gvm_kvm_perf_record(GVM_KVM_PERF_SGI_DISPATCH,
+			    gvm_perf_start_ns);
 	return has_remote;
 #endif
 	return false;
@@ -1328,9 +1333,11 @@ void vgic_v3_dispatch_sgi_remote(struct kvm_vcpu *vcpu, u32 sgi, bool allow_grou
 	}
 
 	raw_spin_lock_irqsave(&irq->irq_lock, flags);
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 	pr_info("GVM vgic remote SGI: target_vcpu=%u sgi=%u intid=%u group=%u allow_group1=%u enabled=%u hw=%u pending_before=%u active=%u irq_vcpu=%p\n",
 		vcpu->vcpu_id, sgi, irq->intid, irq->group, allow_group1,
 		irq->enabled, irq->hw, irq->pending_latch, irq->active, irq->vcpu);
+#endif
 
 	if (!irq->group || allow_group1) {
 		if (!irq->hw) {
@@ -1338,21 +1345,27 @@ void vgic_v3_dispatch_sgi_remote(struct kvm_vcpu *vcpu, u32 sgi, bool allow_grou
 
 			irq->pending_latch = true;
 			queued = vgic_queue_irq_unlock(kvm, irq, flags);
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 			pr_info("GVM vgic remote SGI: queued target_vcpu=%u sgi=%u queued=%u\n",
 				vcpu->vcpu_id, sgi, queued);
+#endif
 		} else {
 			int err;
 			err = irq_set_irqchip_state(irq->host_irq,
 						    IRQCHIP_STATE_PENDING,
 						    true);
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 			pr_info("GVM vgic remote SGI: hw target_vcpu=%u sgi=%u host_irq=%u err=%d\n",
 				vcpu->vcpu_id, sgi, irq->host_irq, err);
+#endif
 			WARN_RATELIMIT(err, "IRQ %d", irq->host_irq);
 			raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
 		}
 	} else {
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 		pr_info("GVM vgic remote SGI: dropped by group target_vcpu=%u sgi=%u group=%u allow_group1=%u\n",
 			vcpu->vcpu_id, sgi, irq->group, allow_group1);
+#endif
 		raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
 	}
 

@@ -61,7 +61,36 @@
 #define KVM_REQ_DSM_WAKEUP_FORWARD   KVM_ARCH_REQ(11)
 #define KVM_REQ_DSM_MMIO_FORWARD   KVM_ARCH_REQ(12)
 #define KVM_REQ_DSM_SPI_FORWARD   KVM_ARCH_REQ(13)
+#define KVM_REQ_DSM_TLBI_FORWARD   KVM_ARCH_REQ(14)
 //#define KVM_REQ_DSM_PSCI_OFF_FORWARD   KVM_ARCH_REQ(12)
+
+enum gvm_kvm_perf_event {
+	GVM_KVM_PERF_SGI_DISPATCH = 0,
+	GVM_KVM_PERF_SGI_REMOTE_REQ,
+	GVM_KVM_PERF_TLBI_HVC_REQ,
+	GVM_KVM_PERF_TLBI_TRAP_BATCH_REQ,
+	GVM_KVM_PERF_TLBI_REMOTE_IOCTL,
+	GVM_KVM_PERF_EXIT_SGI,
+	GVM_KVM_PERF_EXIT_PSCI,
+	GVM_KVM_PERF_EXIT_MMIO,
+	GVM_KVM_PERF_EXIT_SPI,
+	GVM_KVM_PERF_EXIT_TLBI,
+	GVM_KVM_PERF_MAX,
+};
+
+#ifdef CONFIG_GVM_DSM_PERF_TEST
+u64 gvm_kvm_perf_now_ns(void);
+void gvm_kvm_perf_record(enum gvm_kvm_perf_event event, u64 start_ns);
+#else
+static inline u64 gvm_kvm_perf_now_ns(void)
+{
+	return 0;
+}
+
+static inline void gvm_kvm_perf_record(enum gvm_kvm_perf_event event, u64 start_ns)
+{
+}
+#endif
 #endif
 
 #define KVM_DIRTY_LOG_MANUAL_CAPS   (KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE | \
@@ -463,6 +492,7 @@ struct kvm_arch {
 #elif defined(CONFIG_KVM_DSM_IRQ_FORWARD)
 	int dsm_id;
 	int local_cpu_num;
+	bool dsm_tlbi_trap_enabled;
 
 #endif /* CONFIG_KVM_DSM */
 
@@ -803,6 +833,12 @@ struct kvm_vcpu_arch {
 	/* For SPI forwarding */
 	u32 dsm_spi_irq_num;
 	bool dsm_spi_irq_level;
+	/* For TLBI forwarding */
+	u32 dsm_tlbi_encoding;
+	u64 dsm_tlbi_value;
+	u32 dsm_tlbi_pending;
+	u64 dsm_tlbi_trap_count;
+	u64 dsm_tlbi_sync_count;
 #endif
 
 

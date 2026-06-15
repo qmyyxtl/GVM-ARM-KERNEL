@@ -13,6 +13,12 @@
 #include "hisilicon/hisi_virt.h"
 #endif
 
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+#define ARM_SMCCC_GVM_DSM_TLBI_SYNC \
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, ARM_SMCCC_SMC_64, \
+				   ARM_SMCCC_OWNER_VENDOR_HYP, 0x100)
+#endif
+
 #define KVM_ARM_SMCCC_STD_FEATURES				\
 	GENMASK(KVM_REG_ARM_STD_BMAP_BIT_COUNT - 1, 0)
 #define KVM_ARM_SMCCC_STD_HYP_FEATURES				\
@@ -70,6 +76,31 @@ static void kvm_ptp_get_time(struct kvm_vcpu *vcpu, u64 *val)
 	val[2] = upper_32_bits(cycles);
 	val[3] = lower_32_bits(cycles);
 }
+
+
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+static int kvm_gvm_dsm_tlbi_sync(struct kvm_vcpu *vcpu)
+{
+	u64 gvm_perf_start_ns = gvm_kvm_perf_now_ns();
+	u64 start = smccc_get_arg1(vcpu);
+	u64 end = smccc_get_arg2(vcpu);
+
+	kvm_flush_remote_tlbs(vcpu->kvm);
+
+	if (vcpu->kvm->arch.local_cpu_num) {
+		vcpu->arch.dsm_irq_forward_kind = 5;
+		vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
+		vcpu->arch.dsm_tlbi_encoding = 0;
+		vcpu->arch.dsm_tlbi_value = start ^ (end << 1);
+		kvm_make_request(KVM_REQ_DSM_TLBI_FORWARD, vcpu);
+	}
+
+	gvm_kvm_perf_record(GVM_KVM_PERF_TLBI_HVC_REQ,
+			    gvm_perf_start_ns);
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, 0, 0, 0);
+	return 1;
+}
+#endif
 
 static bool kvm_smccc_default_allowed(u32 func_id)
 {
@@ -271,6 +302,11 @@ int kvm_smccc_call_handler(struct kvm_vcpu *vcpu)
 	u8 action;
 	gpa_t gpa;
 
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	if (func_id == ARM_SMCCC_GVM_DSM_TLBI_SYNC)
+		return kvm_gvm_dsm_tlbi_sync(vcpu);
+#endif
+
 	action = kvm_smccc_get_action(vcpu, func_id);
 	switch (action) {
 	case KVM_SMCCC_FILTER_HANDLE:
@@ -412,7 +448,9 @@ int kvm_smccc_call_handler(struct kvm_vcpu *vcpu)
 	case ARM_SMCCC_TRNG_RND64:
 		return kvm_trng_call(vcpu);
 	default:
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 		printk(KERN_WARNING "kvm: Unhandled SMCCC function ID: 0x%08x\n", func_id);
+#endif
 		return kvm_psci_call(vcpu);
 	}
 

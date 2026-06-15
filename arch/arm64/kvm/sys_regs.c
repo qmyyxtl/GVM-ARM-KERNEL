@@ -354,6 +354,7 @@ static bool access_gic_sgi(struct kvm_vcpu *vcpu,
 	}
 
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	u64 gvm_perf_start_ns = gvm_kvm_perf_now_ns();
 	bool has_remote = vgic_v3_dispatch_sgi(vcpu, p->regval, g1);
 	if (!has_remote)
   		return true;
@@ -364,10 +365,9 @@ static bool access_gic_sgi(struct kvm_vcpu *vcpu,
 	vcpu->arch.dsm_irq_forward_target_id = (p->regval & ICC_SGI1R_TARGET_LIST_MASK) >> ICC_SGI1R_TARGET_LIST_SHIFT;
 	vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
 	vcpu->arch.dsm_irq_broadcast = p->regval & BIT_ULL(ICC_SGI1R_IRQ_ROUTING_MODE_BIT);
-	printk(KERN_INFO "Forwarding SGI %u from vCPU %u to target list 0x%x (allow_group1=%u)\n",
-	       vcpu->arch.dsm_irq_sgi, vcpu->arch.dsm_irq_forward_source_id,
-	       vcpu->arch.dsm_irq_forward_target_id, vcpu->arch.dsm_irq_sgi_allow_group1);
 	kvm_make_request(KVM_REQ_DSM_IRQ_FORWARD, vcpu);
+	gvm_kvm_perf_record(GVM_KVM_PERF_SGI_REMOTE_REQ,
+			    gvm_perf_start_ns);
 	return true;
 #endif
 
@@ -2942,6 +2942,74 @@ static const struct sys_reg_desc sys_reg_descs[] = {
 	EL2_REG(SP_EL2, NULL, reset_unknown, 0),
 };
 
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+static bool gvm_is_tlbi_el1_insn(struct sys_reg_params *params)
+{
+	if (params->Op0 != 1 || params->Op1 != 0)
+		return false;
+
+	if (params->CRn != 8 && params->CRn != 9)
+		return false;
+
+	switch (params->CRm) {
+	case 1:
+	case 2:
+	case 3:
+	case 5:
+	case 6:
+	case 7:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool gvm_handle_tlbi_el1(struct kvm_vcpu *vcpu,
+				struct sys_reg_params *params)
+{
+	u32 encoding = sys_insn(params->Op0, params->Op1, params->CRn,
+			       params->CRm, params->Op2);
+#define GVM_DSM_TLBI_BATCH 1024
+
+	if (!gvm_is_tlbi_el1_insn(params))
+		return false;
+
+	/*
+	 * The guest TLBI was trapped before execution. A full local VMID flush
+	 * plus a userspace round-trip for every guest TLBI is too expensive for
+	 * Linux boot and mm activity, so batch the conservative full flush.
+	 *
+	 * This is an experimental sync point: it verifies whether per-TLBI
+	 * full flush/exit is the bottleneck. The final design should move the
+	 * sync to a real guest-visible completion point or a paravirt flush
+	 * hook instead of relying on a fixed batch size.
+	 */
+	vcpu->arch.dsm_tlbi_trap_count++;
+	vcpu->arch.dsm_tlbi_pending++;
+
+	if (vcpu->arch.dsm_tlbi_pending < GVM_DSM_TLBI_BATCH)
+		return true;
+
+	vcpu->arch.dsm_tlbi_pending = 0;
+	vcpu->arch.dsm_tlbi_sync_count++;
+
+	kvm_flush_remote_tlbs(vcpu->kvm);
+
+	if (vcpu->kvm->arch.local_cpu_num) {
+		u64 gvm_perf_start_ns = gvm_kvm_perf_now_ns();
+		vcpu->arch.dsm_irq_forward_kind = 5;
+		vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
+		vcpu->arch.dsm_tlbi_encoding = encoding;
+		vcpu->arch.dsm_tlbi_value = params->regval;
+		kvm_make_request(KVM_REQ_DSM_TLBI_FORWARD, vcpu);
+		gvm_kvm_perf_record(GVM_KVM_PERF_TLBI_TRAP_BATCH_REQ,
+				    gvm_perf_start_ns);
+	}
+
+	return true;
+}
+#endif
+
 static const struct sys_reg_desc *first_idreg;
 
 static bool trap_dbgdidr(struct kvm_vcpu *vcpu,
@@ -3628,6 +3696,11 @@ static bool emulate_sys_reg(struct kvm_vcpu *vcpu,
 			   struct sys_reg_params *params)
 {
 	const struct sys_reg_desc *r;
+
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+	if (gvm_handle_tlbi_el1(vcpu, params))
+		return true;
+#endif
 
 	r = find_reg(params, sys_reg_descs, ARRAY_SIZE(sys_reg_descs));
 

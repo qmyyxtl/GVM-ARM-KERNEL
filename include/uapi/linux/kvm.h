@@ -320,6 +320,8 @@ struct kvm_run {
 			__u64 mmio_val;
 			__u32 spi_irq_num;
 			bool spi_irq_level;
+			__u32 tlbi_encoding;
+			__u64 tlbi_value;
 		} dsm_send_irq;
 		/* KVM_EXIT_UNKNOWN */
 		struct {
@@ -1327,6 +1329,18 @@ struct kvm_dsm_io_forwarding_params {
 	__u32 local_cpu_num;
 };
 #define KVM_DSM_IO_FORWARDING     _IOW(KVMIO, 0xfa, struct kvm_dsm_io_forwarding_params)
+
+struct kvm_tlbi_params {
+	__u32 source_id;
+	__u32 encoding;
+	__u64 value;
+};
+#define KVM_DSM_TLBI              _IOW(KVMIO, 0xfb, struct kvm_tlbi_params)
+
+struct kvm_tlbi_ctrl_params {
+	bool enable;
+};
+#define KVM_DSM_TLBI_CTRL         _IOW(KVMIO, 0xfc, struct kvm_tlbi_ctrl_params)
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;

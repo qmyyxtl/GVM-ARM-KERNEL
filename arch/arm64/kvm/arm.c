@@ -12,6 +12,7 @@
 #include <linux/kvm_host.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/math64.h>
 #include <linux/vmalloc.h>
 #include <linux/fs.h>
 #include <linux/mman.h>
@@ -22,6 +23,9 @@
 #include <linux/irqbypass.h>
 #include <linux/sched/stat.h>
 #include <linux/psci.h>
+#include <linux/ktime.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 #include <trace/events/kvm.h>
 
 #define CREATE_TRACE_POINTS
@@ -71,6 +75,99 @@ bool kvm_ncsnp_support;
 
 /* Capability of DVMBM */
 bool kvm_dvmbm_support;
+
+#ifdef CONFIG_GVM_DSM_PERF_TEST
+struct gvm_kvm_perf_counter {
+	atomic64_t count;
+	atomic64_t total_ns;
+	atomic64_t max_ns;
+};
+
+static struct gvm_kvm_perf_counter gvm_kvm_perf[GVM_KVM_PERF_MAX];
+
+static const char * const gvm_kvm_perf_names[GVM_KVM_PERF_MAX] = {
+	[GVM_KVM_PERF_SGI_DISPATCH] = "host_sgi_dispatch",
+	[GVM_KVM_PERF_SGI_REMOTE_REQ] = "host_sgi_remote_request",
+	[GVM_KVM_PERF_TLBI_HVC_REQ] = "host_tlbi_hvc_request",
+	[GVM_KVM_PERF_TLBI_TRAP_BATCH_REQ] = "host_tlbi_trap_batch_request",
+	[GVM_KVM_PERF_TLBI_REMOTE_IOCTL] = "host_tlbi_remote_ioctl",
+	[GVM_KVM_PERF_EXIT_SGI] = "host_exit_prepare_sgi",
+	[GVM_KVM_PERF_EXIT_PSCI] = "host_exit_prepare_psci",
+	[GVM_KVM_PERF_EXIT_MMIO] = "host_exit_prepare_mmio",
+	[GVM_KVM_PERF_EXIT_SPI] = "host_exit_prepare_spi",
+	[GVM_KVM_PERF_EXIT_TLBI] = "host_exit_prepare_tlbi",
+};
+
+u64 gvm_kvm_perf_now_ns(void)
+{
+	return ktime_get_ns();
+}
+
+void gvm_kvm_perf_record(enum gvm_kvm_perf_event event, u64 start_ns)
+{
+	u64 delta, old_max;
+
+	if (event >= GVM_KVM_PERF_MAX)
+		return;
+
+	delta = ktime_get_ns() - start_ns;
+	atomic64_inc(&gvm_kvm_perf[event].count);
+	atomic64_add(delta, &gvm_kvm_perf[event].total_ns);
+
+	do {
+		old_max = atomic64_read(&gvm_kvm_perf[event].max_ns);
+		if (old_max >= delta)
+			break;
+	} while (atomic64_cmpxchg(&gvm_kvm_perf[event].max_ns,
+				  old_max, delta) != old_max);
+}
+
+static int gvm_kvm_perf_show(struct seq_file *s, void *unused)
+{
+	int i;
+
+	seq_puts(s, "GVM KVM perf:\n");
+	for (i = 0; i < GVM_KVM_PERF_MAX; i++) {
+		u64 count = atomic64_read(&gvm_kvm_perf[i].count);
+		u64 total = atomic64_read(&gvm_kvm_perf[i].total_ns);
+		u64 avg = count ? div64_u64(total, count) : 0;
+
+		seq_printf(s,
+			   "  %-32s count=%llu total_ns=%llu avg_ns=%llu max_ns=%llu\n",
+			   gvm_kvm_perf_names[i], count, total, avg,
+			   atomic64_read(&gvm_kvm_perf[i].max_ns));
+	}
+
+	return 0;
+}
+
+static int gvm_kvm_perf_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, gvm_kvm_perf_show, NULL);
+}
+
+static ssize_t gvm_kvm_perf_write(struct file *file, const char __user *buf,
+				  size_t len, loff_t *ppos)
+{
+	memset(gvm_kvm_perf, 0, sizeof(gvm_kvm_perf));
+	return len;
+}
+
+static const struct file_operations gvm_kvm_perf_fops = {
+	.owner = THIS_MODULE,
+	.open = gvm_kvm_perf_open,
+	.read = seq_read,
+	.write = gvm_kvm_perf_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static void gvm_kvm_perf_init_debugfs(void)
+{
+	debugfs_create_file("gvm_kvm_perf", 0644, NULL, NULL,
+			    &gvm_kvm_perf_fops);
+}
+#endif
 
 static DEFINE_PER_CPU(unsigned char, kvm_hyp_initialized);
 
@@ -1119,6 +1216,7 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 	if (kvm_request_pending(vcpu)) {
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
 		if (kvm_check_request(KVM_REQ_DSM_IRQ_FORWARD, vcpu)) {
+			u64 gvm_perf_start_ns = gvm_kvm_perf_now_ns();
             vcpu->run->exit_reason = KVM_EXIT_DSM_SEND_IRQ;
             vcpu->run->dsm_send_irq.source_id = vcpu->arch.dsm_irq_forward_source_id;
 			vcpu->run->dsm_send_irq.target_id = vcpu->arch.dsm_irq_forward_target_id;
@@ -1127,12 +1225,13 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 			vcpu->run->dsm_send_irq.sgi = vcpu->arch.dsm_irq_sgi;
 			vcpu->run->dsm_send_irq.sgi_reg = vcpu->arch.dsm_irq_sgi_reg;
 			vcpu->run->dsm_send_irq.allow_group1 = vcpu->arch.dsm_irq_sgi_allow_group1;
-			printk(KERN_INFO "kvm: vCPU %u requested DSM IRQ forward to target vCPU %lx, broadcast: %u, sgi: %u, sgi_reg: 0x%llx, allow_group1: %u\n",
-			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_forward_target_id, vcpu->arch.dsm_irq_broadcast, vcpu->arch.dsm_irq_sgi, vcpu->arch.dsm_irq_sgi_reg, vcpu->arch.dsm_irq_sgi_allow_group1);
+			gvm_kvm_perf_record(GVM_KVM_PERF_EXIT_SGI,
+					    gvm_perf_start_ns);
 			return 0;   /* 0 表示退出到 userspace（QEMU） */
         }
 		if (kvm_check_request(KVM_REQ_DSM_WAKEUP_FORWARD,vcpu))
 		{
+			u64 gvm_perf_start_ns = gvm_kvm_perf_now_ns();
 			vcpu->run->exit_reason = KVM_EXIT_DSM_SEND_IRQ;
 			vcpu->run->dsm_send_irq.source_id = vcpu->arch.dsm_irq_forward_source_id;
 			vcpu->run->dsm_send_irq.target_id = vcpu->arch.dsm_irq_forward_target_id;
@@ -1140,33 +1239,59 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 			vcpu->run->dsm_send_irq.pc = vcpu->arch.dsm_irq_psci_pc;
 			vcpu->run->dsm_send_irq.r0 = vcpu->arch.dsm_irq_psci_r0;
 			vcpu->run->dsm_send_irq.be = vcpu->arch.dsm_irq_psci_be;
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 			printk(KERN_INFO "kvm: vCPU %u requested DSM wakeup forward to target vCPU, pc: 0x%llx, r0: 0x%llx, be: %u\n",
 			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_psci_pc,
 			       vcpu->arch.dsm_irq_psci_r0, vcpu->arch.dsm_irq_psci_be);
+#endif
+			gvm_kvm_perf_record(GVM_KVM_PERF_EXIT_PSCI,
+					    gvm_perf_start_ns);
 			return 0;
 		}
 		if (kvm_check_request(KVM_REQ_DSM_MMIO_FORWARD,vcpu))
 		{
+			u64 gvm_perf_start_ns = gvm_kvm_perf_now_ns();
 			vcpu->run->exit_reason = KVM_EXIT_DSM_SEND_IRQ;
 			vcpu->run->dsm_send_irq.source_id = vcpu->arch.dsm_irq_forward_source_id;
 			vcpu->run->dsm_send_irq.kind = vcpu->arch.dsm_irq_forward_kind;
 			vcpu->run->dsm_send_irq.mmio_gpa = vcpu->arch.dsm_mmio_gpa;
 			vcpu->run->dsm_send_irq.mmio_len = vcpu->arch.dsm_mmio_len;
 			vcpu->run->dsm_send_irq.mmio_val = vcpu->arch.dsm_mmio_val;
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 			printk(KERN_INFO "kvm: vCPU %u requested DSM MMIO forward, gpa: 0x%llx, len: %u, val: 0x%llx\n",
 			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_mmio_gpa,
 			       vcpu->arch.dsm_mmio_len, vcpu->arch.dsm_mmio_val);
+#endif
+			gvm_kvm_perf_record(GVM_KVM_PERF_EXIT_MMIO,
+					    gvm_perf_start_ns);
 			return 0;
 		}
 		if (kvm_check_request(KVM_REQ_DSM_SPI_FORWARD,vcpu))
 		{
+			u64 gvm_perf_start_ns = gvm_kvm_perf_now_ns();
 			vcpu->run->exit_reason = KVM_EXIT_DSM_SEND_IRQ;
 			vcpu->run->dsm_send_irq.source_id = vcpu->arch.dsm_irq_forward_source_id;
 			vcpu->run->dsm_send_irq.kind = vcpu->arch.dsm_irq_forward_kind;
 			vcpu->run->dsm_send_irq.spi_irq_num = vcpu->arch.dsm_spi_irq_num;
 			vcpu->run->dsm_send_irq.spi_irq_level = vcpu->arch.dsm_spi_irq_level;
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 			printk(KERN_INFO "kvm: vCPU %u requested DSM SPI IRQ forward, irq_num: %u, level: %u\n",
 			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_spi_irq_num, vcpu->arch.dsm_spi_irq_level);
+#endif
+			gvm_kvm_perf_record(GVM_KVM_PERF_EXIT_SPI,
+					    gvm_perf_start_ns);
+			return 0;
+		}
+		if (kvm_check_request(KVM_REQ_DSM_TLBI_FORWARD,vcpu))
+		{
+			u64 gvm_perf_start_ns = gvm_kvm_perf_now_ns();
+			vcpu->run->exit_reason = KVM_EXIT_DSM_SEND_IRQ;
+			vcpu->run->dsm_send_irq.source_id = vcpu->arch.dsm_irq_forward_source_id;
+			vcpu->run->dsm_send_irq.kind = vcpu->arch.dsm_irq_forward_kind;
+			vcpu->run->dsm_send_irq.tlbi_encoding = vcpu->arch.dsm_tlbi_encoding;
+			vcpu->run->dsm_send_irq.tlbi_value = vcpu->arch.dsm_tlbi_value;
+			gvm_kvm_perf_record(GVM_KVM_PERF_EXIT_TLBI,
+					    gvm_perf_start_ns);
 			return 0;
 		}
 #endif
@@ -1624,11 +1749,6 @@ int kvm_vm_ioctl_irq_line(struct kvm *kvm, struct kvm_irq_level *irq_level,
 
 		if (irq_num < VGIC_NR_PRIVATE_IRQS)
 			return -EINVAL;
-
-		if (irq_num == 79)
-			pr_info("GVM vgic79 irq_line dsm=%d vcpu_idx=%u irq_num=%u level=%d online_vcpus=%d dist_enabled=%d\n",
-				kvm->arch.dsm_id, vcpu_idx, irq_num, level, nrcpus,
-				kvm->arch.vgic.enabled);
 
 		return kvm_vgic_inject_irq(kvm, 0, irq_num, level, NULL);
 	}
@@ -2113,6 +2233,7 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
 	case KVM_DSM_IO_FORWARDING:{
 		struct kvm_dsm_io_forwarding_params params;
+
 		if (copy_from_user(&params, argp, sizeof(params)))
 			return -EFAULT;
 		kvm->arch.dsm_id = params.dsm_index;
@@ -2141,14 +2262,18 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 			return -EINVAL;
 		} else {
 			// vgic_v3_dispatch_sgi(vcpu,params.sgi_reg,params.allow_group);
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 			printk(KERN_INFO "GVM KVM_DSM_SGI: source=%u target=%u vcpu_id=%u mp_state=%d sgi=%u allow_group=%u sgi_reg=0x%llx\n",
 			       params.source_id, params.target_id, vcpu->vcpu_id,
 			       READ_ONCE(vcpu->arch.mp_state.mp_state), params.sgi,
 			       params.allow_group, params.sgi_reg);
+#endif
 			vgic_v3_dispatch_sgi_remote(vcpu, params.sgi, params.allow_group);
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 			printk(KERN_INFO "GVM KVM_DSM_SGI: dispatch returned target=%u vcpu_id=%u sgi=%u mp_state=%d\n",
 			       params.target_id, vcpu->vcpu_id, params.sgi,
 			       READ_ONCE(vcpu->arch.mp_state.mp_state));
+#endif
 			return 0;
 		}
 	}
@@ -2159,8 +2284,10 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		if (copy_from_user(&params, argp, sizeof(params)))
 			return -EFAULT;
 		vcpu = kvm_get_vcpu(kvm, params.target_id);
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 		printk(KERN_INFO "kvm-dsm: PSCI CPU_ON for target vCPU %d pc 0x%llx r0 0x%llx be %d\n",
 		       params.target_id, params.pc, params.r0, params.be);
+#endif
 		kvm_psci_vcpu_on_by_remote(vcpu,params.pc, params.r0, params.be);
 		return 0;
 	}
@@ -2170,8 +2297,10 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		struct kvm_vcpu *vcpu = NULL;
 		if (copy_from_user(&params, argp, sizeof(params)))
 			return -EFAULT;
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 		printk(KERN_INFO "kvm-dsm: VGIC3 MMIO for target vCPU %d addr 0x%llx len %u data 0x%llx\n",
 		       params.vcpu_id, params.addr, params.len, params.data);
+#endif
 		// kvm_vgic3_mmio_write(vcpu, params.addr, params.len, params.data);
 		kvm_dsm_vgic_mmio_write(kvm, params.addr, params.len, params.data);
 		return 0;
@@ -2181,6 +2310,47 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		if (copy_from_user(&params, argp, sizeof(params)))
 			return -EFAULT;
 		return kvm_vgic_inject_irq(kvm, 0, params.spi_irq_num, params.spi_irq_level, NULL);
+	}
+	case KVM_DSM_TLBI: {
+		struct kvm_tlbi_params params;
+		u64 gvm_perf_start_ns;
+
+		if (copy_from_user(&params, argp, sizeof(params)))
+			return -EFAULT;
+		gvm_perf_start_ns = gvm_kvm_perf_now_ns();
+		kvm_flush_remote_tlbs(kvm);
+		gvm_kvm_perf_record(GVM_KVM_PERF_TLBI_REMOTE_IOCTL,
+				    gvm_perf_start_ns);
+		return 0;
+	}
+	case KVM_DSM_TLBI_CTRL: {
+		struct kvm_tlbi_ctrl_params params;
+		struct kvm_vcpu *vcpu;
+		unsigned long i;
+
+		if (copy_from_user(&params, argp, sizeof(params)))
+			return -EFAULT;
+
+		kvm->arch.dsm_tlbi_trap_enabled = params.enable;
+		kvm_for_each_vcpu(i, vcpu, kvm) {
+			if (params.enable) {
+				vcpu->arch.dsm_tlbi_pending = 0;
+				vcpu->arch.dsm_tlbi_trap_count = 0;
+				vcpu->arch.dsm_tlbi_sync_count = 0;
+				vcpu->arch.hcr_el2 |= HCR_TTLBIS | HCR_TTLBOS;
+			} else {
+				if (vcpu->arch.dsm_tlbi_pending) {
+					kvm_flush_remote_tlbs(kvm);
+					vcpu->arch.dsm_tlbi_pending = 0;
+				}
+				pr_info("kvm-dsm: TLBI trap stats vcpu=%lu traps=%llu syncs=%llu\n",
+					i, vcpu->arch.dsm_tlbi_trap_count,
+					vcpu->arch.dsm_tlbi_sync_count);
+				vcpu->arch.hcr_el2 &= ~(HCR_TTLB | HCR_TTLBIS | HCR_TTLBOS);
+			}
+			kvm_vcpu_kick(vcpu);
+		}
+		return 0;
 	}
 
 #endif
@@ -2665,6 +2835,10 @@ static bool __init init_psci_relay(void)
 static int __init init_subsystems(void)
 {
 	int err = 0;
+
+#ifdef CONFIG_GVM_DSM_PERF_TEST
+	gvm_kvm_perf_init_debugfs();
+#endif
 
 	/*
 	 * Enable hardware so that subsystem initialisation can access EL2.

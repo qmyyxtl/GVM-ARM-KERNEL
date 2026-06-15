@@ -29,6 +29,8 @@ void kvm_update_pvsched_preempted(struct kvm_vcpu *vcpu, u32 preempted)
 	pagefault_disable();
 
 	idx = srcu_read_lock(&kvm->srcu);
+	pr_info_ratelimited("GVM guestmem pvsched put vcpu=%u gpa=0x%llx len=%zu preempted=%u\n",
+			    vcpu->vcpu_id, base + offset, sizeof(preempted), preempted);
 	kvm_put_guest(kvm, base + offset, cpu_to_le32(preempted));
 	srcu_read_unlock(&kvm->srcu, idx);
 

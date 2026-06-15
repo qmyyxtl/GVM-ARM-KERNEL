@@ -3116,6 +3116,8 @@ int __kvm_read_guest_page(struct kvm_memory_slot *slot, gfn_t gfn,
 	unsigned long addr;
 
 	addr = gfn_to_hva_memslot_prot(slot, gfn, NULL);
+	pr_info_ratelimited("GVM guestmem read_page slot=%p gfn=0x%llx offset=%d len=%d hva=0x%lx\n",
+			    slot, (unsigned long long)gfn, offset, len, addr);
 	if (kvm_is_error_hva(addr))
 		return -EFAULT;
 	r = __copy_from_user(data, (void __user *)addr + offset, len);
@@ -3218,6 +3220,8 @@ int __kvm_write_guest_page(struct kvm *kvm,
 	unsigned long addr;
 
 	addr = gfn_to_hva_memslot(memslot, gfn);
+	pr_info_ratelimited("GVM guestmem write_page kvm=%p slot=%p gfn=0x%llx offset=%d len=%d hva=0x%lx\n",
+			    kvm, memslot, (unsigned long long)gfn, offset, len, addr);
 	if (kvm_is_error_hva(addr))
 		return -EFAULT;
 	r = __copy_to_user((void __user *)addr + offset, data, len);

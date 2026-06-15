@@ -139,6 +139,8 @@ static inline int vgic_write_guest_lock(struct kvm *kvm, gpa_t gpa,
 	int ret;
 
 	dist->table_write_in_progress = true;
+	pr_info_ratelimited("GVM guestmem vgic write_guest_lock kvm=%p gpa=0x%llx len=%lu\n",
+			    kvm, (unsigned long long)gpa, len);
 	ret = kvm_write_guest_lock(kvm, gpa, data, len);
 	dist->table_write_in_progress = false;
 

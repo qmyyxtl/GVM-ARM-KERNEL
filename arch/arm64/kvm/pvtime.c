@@ -23,10 +23,14 @@ void kvm_update_stolen_time(struct kvm_vcpu *vcpu)
 		return;
 
 	idx = srcu_read_lock(&kvm->srcu);
+	pr_info_ratelimited("GVM guestmem pvtime get vcpu=%u gpa=0x%llx len=%zu\n",
+			    vcpu->vcpu_id, base + offset, sizeof(steal));
 	if (!kvm_get_guest(kvm, base + offset, steal)) {
 		steal = le64_to_cpu(steal);
 		vcpu->arch.steal.last_steal = READ_ONCE(current->sched_info.run_delay);
 		steal += vcpu->arch.steal.last_steal - last_steal;
+		pr_info_ratelimited("GVM guestmem pvtime put vcpu=%u gpa=0x%llx len=%zu\n",
+				    vcpu->vcpu_id, base + offset, sizeof(steal));
 		kvm_put_guest(kvm, base + offset, cpu_to_le64(steal));
 	}
 	srcu_read_unlock(&kvm->srcu, idx);
@@ -62,6 +66,8 @@ gpa_t kvm_init_stolen_time(struct kvm_vcpu *vcpu)
 	 * the feature enabled.
 	 */
 	vcpu->arch.steal.last_steal = current->sched_info.run_delay;
+	pr_info_ratelimited("GVM guestmem pvtime init_write vcpu=%u gpa=0x%llx len=%zu\n",
+			    vcpu->vcpu_id, base, sizeof(init_values));
 	kvm_write_guest_lock(kvm, base, &init_values, sizeof(init_values));
 
 	return base;

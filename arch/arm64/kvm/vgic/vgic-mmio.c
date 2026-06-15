@@ -1124,8 +1124,10 @@ static int dispatch_mmio_write(struct kvm_vcpu *vcpu, struct kvm_io_device *dev,
 	vcpu->arch.dsm_mmio_gpa = addr;
 	vcpu->arch.dsm_mmio_len = len;
 	vcpu->arch.dsm_mmio_val = data;
+#ifdef CONFIG_GVM_DSM_PERF_TEST
 	printk(KERN_INFO "kvm: DSM IRQ forward set by VGIC MMIO write for source vCPU %u addr=0x%llx len=%u val=0x%llx\n",
 	       vcpu->arch.dsm_irq_forward_source_id, addr, len, data);
+#endif
 	kvm_make_request(KVM_REQ_DSM_MMIO_FORWARD, vcpu);
 #endif
 		break;
