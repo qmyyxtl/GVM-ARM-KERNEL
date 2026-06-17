@@ -1239,6 +1239,12 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 			vcpu->run->dsm_send_irq.pc = vcpu->arch.dsm_irq_psci_pc;
 			vcpu->run->dsm_send_irq.r0 = vcpu->arch.dsm_irq_psci_r0;
 			vcpu->run->dsm_send_irq.be = vcpu->arch.dsm_irq_psci_be;
+			printk(KERN_INFO "GVM PSCI source: exit to qemu source=%u target=%u pc=0x%llx r0=0x%llx be=%u\n",
+			       vcpu->run->dsm_send_irq.source_id,
+			       vcpu->run->dsm_send_irq.target_id,
+			       vcpu->run->dsm_send_irq.pc,
+			       vcpu->run->dsm_send_irq.r0,
+			       vcpu->run->dsm_send_irq.be);
 #ifdef CONFIG_GVM_DSM_PERF_TEST
 			printk(KERN_INFO "kvm: vCPU %u requested DSM wakeup forward to target vCPU, pc: 0x%llx, r0: 0x%llx, be: %u\n",
 			       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_psci_pc,

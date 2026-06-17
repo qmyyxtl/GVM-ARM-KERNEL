@@ -10,6 +10,8 @@
 
 #include <kvm/arm_hypercalls.h>
 
+#include "dsm.h"
+
 void kvm_update_stolen_time(struct kvm_vcpu *vcpu)
 {
 	struct kvm *kvm = vcpu->kvm;
@@ -17,12 +19,17 @@ void kvm_update_stolen_time(struct kvm_vcpu *vcpu)
 	u64 last_steal = vcpu->arch.steal.last_steal;
 	u64 offset = offsetof(struct pvclock_vcpu_stolen_time, stolen_time);
 	u64 steal = 0;
+	struct kvm_memslots *slots = NULL;
 	int idx;
 
 	if (base == INVALID_GPA)
 		return;
 
 	idx = srcu_read_lock(&kvm->srcu);
+	if (kvm_dsm_vcpu_acquire(vcpu, &slots, base + offset,
+				 sizeof(steal), true) < 0)
+		goto out_unlock;
+
 	pr_info_ratelimited("GVM guestmem pvtime get vcpu=%u gpa=0x%llx len=%zu\n",
 			    vcpu->vcpu_id, base + offset, sizeof(steal));
 	if (!kvm_get_guest(kvm, base + offset, steal)) {
@@ -33,6 +40,8 @@ void kvm_update_stolen_time(struct kvm_vcpu *vcpu)
 				    vcpu->vcpu_id, base + offset, sizeof(steal));
 		kvm_put_guest(kvm, base + offset, cpu_to_le64(steal));
 	}
+	kvm_dsm_vcpu_release(vcpu, slots, base + offset, sizeof(steal));
+out_unlock:
 	srcu_read_unlock(&kvm->srcu, idx);
 }
 
@@ -57,6 +66,8 @@ gpa_t kvm_init_stolen_time(struct kvm_vcpu *vcpu)
 	struct pvclock_vcpu_stolen_time init_values = {};
 	struct kvm *kvm = vcpu->kvm;
 	u64 base = vcpu->arch.steal.base;
+	struct kvm_memslots *slots = NULL;
+	int idx;
 
 	if (base == INVALID_GPA)
 		return base;
@@ -68,7 +79,13 @@ gpa_t kvm_init_stolen_time(struct kvm_vcpu *vcpu)
 	vcpu->arch.steal.last_steal = current->sched_info.run_delay;
 	pr_info_ratelimited("GVM guestmem pvtime init_write vcpu=%u gpa=0x%llx len=%zu\n",
 			    vcpu->vcpu_id, base, sizeof(init_values));
-	kvm_write_guest_lock(kvm, base, &init_values, sizeof(init_values));
+	idx = srcu_read_lock(&kvm->srcu);
+	if (kvm_dsm_vcpu_acquire(vcpu, &slots, base,
+				 sizeof(init_values), true) >= 0) {
+		kvm_write_guest(kvm, base, &init_values, sizeof(init_values));
+		kvm_dsm_vcpu_release(vcpu, slots, base, sizeof(init_values));
+	}
+	srcu_read_unlock(&kvm->srcu, idx);
 
 	return base;
 }

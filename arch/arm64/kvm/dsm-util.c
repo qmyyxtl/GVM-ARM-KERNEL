@@ -45,14 +45,41 @@ int dsm_create_memslot(struct kvm_dsm_memory_slot *slot,
 	unsigned long i;
 	int ret = 0;
 // printk("dsm_create_memslot");
+	slot->rmap = NULL;
+	slot->backup_rmap = NULL;
+	slot->rmap_lock = NULL;
+	slot->vfn_dsm_state = NULL;
+
+	slot->rmap = kvm_kvzalloc(npages * sizeof(*slot->rmap));
+	if (!slot->rmap) {
+		ret = -ENOMEM;
+		goto out_free_rmap;
+	}
+
+	slot->backup_rmap = kvm_kvzalloc(npages * sizeof(*slot->backup_rmap));
+	if (!slot->backup_rmap) {
+		ret = -ENOMEM;
+		goto out_free_backup_rmap;
+	}
+
+	slot->rmap_lock = kvm_kvzalloc(sizeof(*slot->rmap_lock));
+	if (!slot->rmap_lock) {
+		ret = -ENOMEM;
+		goto out_free_rmap_lock;
+	}
+
 	slot->vfn_dsm_state = kvm_kvzalloc(npages * sizeof(*slot->vfn_dsm_state));
 	if (!slot->vfn_dsm_state){
         ret = -ENOMEM;
 		goto out_free_dsm_state;
     }
 
+	mutex_init(slot->rmap_lock);
+
 
 	for (i = 0; i < npages; i++) {
+		INIT_HLIST_HEAD(&slot->rmap[i]);
+		INIT_HLIST_HEAD(&slot->backup_rmap[i]);
 #ifdef IVY_KVM_DSM
 		mutex_init(&slot->vfn_dsm_state[i].fast_path_lock);
 #endif
@@ -63,6 +90,12 @@ int dsm_create_memslot(struct kvm_dsm_memory_slot *slot,
 
 out_free_dsm_state:
 	kvfree(slot->vfn_dsm_state);
+	kvfree(slot->rmap_lock);
+out_free_rmap_lock:
+	kvfree(slot->backup_rmap);
+out_free_backup_rmap:
+	kvfree(slot->rmap);
+out_free_rmap:
 	return ret;
 }
 
@@ -108,7 +141,8 @@ void dsm_lock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot,
 		/* ~10s */
 		if (retry_cnt > 1000000) {
 printk("try to get gfn by vfn %llx and slot_base_vfn(dsm_mem) %llx",vfn,slot->base_vfn);
-			gfn_t gfn = __kvm_dsm_vfn_to_gfn(slot,vfn,NULL);
+			gfn_t gfn = __kvm_dsm_vfn_to_gfn(slot, false, vfn,
+							 NULL, NULL, NULL);
 printk("dsm_lock_retry, get gfn %llx by vfn %llx and slot_base_vfn %llx",
  gfn,vfn,slot->base_vfn);
 			get_task_comm(cur_comm, current);
@@ -138,11 +172,10 @@ printk("dsm_lock_retry, get gfn %llx by vfn %llx and slot_base_vfn %llx",
 void dsm_unlock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn,
 		struct kvm_memory_slot *memslot)
 {
-	gfn_t gfn = vfn - slot->base_vfn;
-	if (memslot != NULL)
-		gfn += memslot->base_gfn;
-	// printk("dsm_unlock at gfn %llx",gfn);
-	return mutex_unlock(&slot->vfn_dsm_state[gfn].lock);
+	unsigned long idx = vfn - slot->base_vfn;
+
+	WARN_ON_ONCE(idx >= slot->npages);
+	mutex_unlock(&slot->vfn_dsm_state[idx].lock);
 }
 
 int __kvm_dsm_trylock(struct mutex *l)
@@ -172,7 +205,7 @@ int dsm_trylock_timeout(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t
 #ifdef CONFIG_DEBUG_MUTEXES
        char lock_owner_comm[TASK_COMM_LEN];
 #endif
-       gfn_t gfn = __kvm_dsm_vfn_to_gfn(slot, vfn, NULL);
+       gfn_t gfn = __kvm_dsm_vfn_to_gfn(slot, false, vfn, NULL, NULL, NULL);
 
        ret = dsm_trylock(kvm, slot, vfn);
        if (ret == -EAGAIN && retry_cnt) {
@@ -410,7 +443,8 @@ void kvm_dsm_report_profile(struct kvm *kvm)
 					read_most[i].read_pf = atomic_read(&info->read_pf);
 					read_most[i].write_pf = atomic_read(&info->write_pf);
 					read_most[i].vfn = slot->base_vfn + k;
-					read_most[i].gfn = __kvm_dsm_vfn_to_gfn(slot,slot->base_vfn + k,NULL);
+					read_most[i].gfn = __kvm_dsm_vfn_to_gfn(slot, false,
+							slot->base_vfn + k, NULL, NULL, NULL);
 				}
 				if (atomic_read(&info->write_pf) > write_faults && (i == 0 ||
 							atomic_read(&info->write_pf) < write_most[i - 1].write_pf)) {
@@ -418,7 +452,8 @@ void kvm_dsm_report_profile(struct kvm *kvm)
 					write_most[i].read_pf = atomic_read(&info->read_pf);
 					write_most[i].write_pf = atomic_read(&info->write_pf);
 					write_most[i].vfn = slot->base_vfn + k;
-					write_most[i].gfn = __kvm_dsm_vfn_to_gfn(slot,slot->base_vfn + k,NULL);
+					write_most[i].gfn = __kvm_dsm_vfn_to_gfn(slot, false,
+							slot->base_vfn + k, NULL, NULL, NULL);
 				}
 			}
 		}

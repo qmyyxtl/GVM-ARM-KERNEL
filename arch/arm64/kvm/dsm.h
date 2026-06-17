@@ -119,6 +119,7 @@ static inline void kvm_dsm_remove_memslot(struct kvm *kvm,
 		struct kvm_memory_slot *slot)
 {
 }
+
 #endif /* CONFIG_KVM_DSM */
 
 #endif /* ARCH_ARM_KVM_DSM_H */

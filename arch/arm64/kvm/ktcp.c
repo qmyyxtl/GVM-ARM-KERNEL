@@ -32,6 +32,8 @@
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/kvm_host.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
 
 #include "ktcp.h"
 
@@ -58,6 +60,11 @@ struct ktcp_cb
 
 #define KTCP_BUFFER_SIZE (sizeof(struct ktcp_hdr) + PAGE_SIZE)
 
+static inline bool ktcp_current_should_stop(void)
+{
+	return (current->flags & PF_KTHREAD) && kthread_should_stop();
+}
+
 static int __ktcp_send(struct socket *sock, const char *buffer, size_t length,
 		unsigned long flags)
 {
@@ -81,6 +88,10 @@ repeat_send:
 
 	len = kernel_sendmsg(sock, &msg, &vec, 1, left);
 	if (len == -EAGAIN || len == -ERESTARTSYS) {
+		if (fatal_signal_pending(current))
+			return -ERESTARTSYS;
+		cond_resched();
+		usleep_range(1, 10);
 		goto repeat_send;
 	}
 	if (len > 0) {
@@ -164,7 +175,19 @@ static int build_ktcp_recv_output(ktcp_msg_t msg, char *buffer, tx_add_t *tx_add
 {
 	size_t real_length;
 	struct ktcp_hdr hdr;
+
+	if (!msg.recv_buf)
+		return -EINVAL;
+
 	memcpy(&hdr, (char *)msg.recv_buf, sizeof(struct ktcp_hdr));
+	if (hdr.length < sizeof(struct ktcp_hdr) ||
+	    hdr.length > KTCP_BUFFER_SIZE) {
+		printk(KERN_ERR "%s: invalid ktcp message length %zu\n",
+		       __func__, hdr.length);
+		kfree(msg.recv_buf);
+		return -EINVAL;
+	}
+
 	real_length = hdr.length - sizeof(struct ktcp_hdr);
 	memcpy(buffer, (char *)msg.recv_buf + sizeof(struct ktcp_hdr), real_length);
 	*tx_add = hdr.tx_add;
@@ -184,7 +207,7 @@ static int __ktcp_receive(struct socket *sock, char *buffer, size_t expected_siz
 		.msg_namelen = 0,
 		.msg_control = NULL,
 		.msg_controllen = 0,
-		.msg_flags   = flags | MSG_DONTWAIT,
+		.msg_flags   = MSG_DONTWAIT,
 	};
 
 	if (expected_size == 0) {
@@ -192,9 +215,12 @@ static int __ktcp_receive(struct socket *sock, char *buffer, size_t expected_siz
 	}
 
 read_again:
+	if (fatal_signal_pending(current) || ktcp_current_should_stop())
+		return -ERESTARTSYS;
+
 	vec.iov_len = expected_size - len;
 	vec.iov_base = buffer + len;
-	ret = kernel_recvmsg(sock, &msg, &vec, 1, expected_size - len, flags | MSG_DONTWAIT);
+	ret = kernel_recvmsg(sock, &msg, &vec, 1, expected_size - len, MSG_DONTWAIT);
 
 	if (ret == 0) {
 		return len;
@@ -206,8 +232,8 @@ read_again:
 		return ret;
 	}
 
-	if (ret == -EAGAIN || ret == -ERESTARTSYS) {
-		goto read_again;
+	if (ret == -EAGAIN || ret == -EWOULDBLOCK || ret == -ERESTARTSYS) {
+		return len ? -EAGAIN : ret;
 	}
 	else if (ret < 0) {
 		printk(KERN_ERR "kernel_recvmsg %d\n", ret);
@@ -215,7 +241,8 @@ read_again:
 	}
 	len += ret;
 	if (len != expected_size) {
-		// printk(KERN_WARNING "gvmdebug ktcp_receive receive %d bytes which expected_size=%lu bytes, read again", len, expected_size);
+		cond_resched();
+		usleep_range(1, 10);
 		goto read_again;
 	}
 
@@ -235,12 +262,17 @@ int ktcp_receive(struct ktcp_cb *cb, char *buffer, unsigned long flags,
 
 	mutex_lock(&cb->rlock);
 repoll:
+	if (fatal_signal_pending(current) || ktcp_current_should_stop()) {
+		ret = -ERESTARTSYS;
+		goto out;
+	}
+
 	if (search_recv_buf(cb, tx_add->txid, &msg)){
 		ret = build_ktcp_recv_output(msg, buffer, tx_add);
 		mutex_unlock(&cb->rlock);
 		return ret;
 	}
-	local_buffer = kmalloc(KTCP_BUFFER_SIZE, GFP_KERNEL);
+	local_buffer = kzalloc(KTCP_BUFFER_SIZE, GFP_KERNEL);
 	if (!local_buffer) {
 		ret = -ENOMEM;
 		goto out;
@@ -251,6 +283,7 @@ repoll:
 			mutex_unlock(&cb->rlock);
 			usec_sleep = (usec_sleep + 1) > 1000 ? 1000 : (usec_sleep + 1);
 			usleep_range(usec_sleep, usec_sleep);
+			cond_resched();
 			mutex_lock(&cb->rlock);
 			kfree(local_buffer);
 			goto repoll;
@@ -260,8 +293,22 @@ repoll:
 				__func__, ret);
 		goto out;
 	}
+	if (ret != KTCP_BUFFER_SIZE) {
+		kfree(local_buffer);
+		ret = ret ? -EIO : -ECONNRESET;
+		printk(KERN_ERR "%s: short ktcp receive, ret %d\n",
+		       __func__, ret);
+		goto out;
+	}
 	usec_sleep = 0;
 	memcpy(&hdr, local_buffer, sizeof(hdr));
+	if (hdr.length < sizeof(hdr) || hdr.length > KTCP_BUFFER_SIZE) {
+		kfree(local_buffer);
+		ret = -EINVAL;
+		printk(KERN_ERR "%s: invalid ktcp header length %zu\n",
+		       __func__, hdr.length);
+		goto out;
+	}
 	msg.recv_buf = local_buffer;
 	msg.txid = hdr.tx_add.txid;
 	if (hdr.tx_add.txid != tx_add->txid && tx_add->txid != 0xFF){
@@ -269,17 +316,20 @@ repoll:
 			mutex_unlock(&cb->rlock);
 			usec_sleep = (usec_sleep + 1) > 1000 ? 1000 : (usec_sleep + 1);
 			usleep_range(usec_sleep, usec_sleep);
+			cond_resched();
 			mutex_lock(&cb->rlock);
 		}
 		usec_sleep = 0;
 		goto repoll;
 	}
 	else{
-		build_ktcp_recv_output(msg, buffer, tx_add);
+		ret = build_ktcp_recv_output(msg, buffer, tx_add);
+		if (ret < 0)
+			goto out;
 	}
 out:
 	mutex_unlock(&cb->rlock);
-	return ret < 0 ? ret : hdr.length - sizeof(struct ktcp_hdr);
+	return ret;
 }
 
 static int ktcp_create_cb(struct ktcp_cb **cbp)
@@ -423,7 +473,7 @@ re_accept:
 	ret = listen_socket->ops->accept(listen_socket, accept_socket, flag,0);
 	printk(KERN_ERR "ktcp_accept retry 432\n");
 	if (ret == -ERESTARTSYS) {
-		if (kthread_should_stop())
+		if (ktcp_current_should_stop())
 			return ret;
 		goto re_accept;
 	}

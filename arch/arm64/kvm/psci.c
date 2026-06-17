@@ -57,6 +57,24 @@ static inline bool kvm_psci_valid_affinity(struct kvm_vcpu *vcpu,
 	return !(affinity & ~MPIDR_HWID_BITMASK);
 }
 
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
+static bool kvm_psci_target_is_local(struct kvm_vcpu *target_vcpu)
+{
+	struct kvm *kvm;
+	u32 local_cpu_num;
+
+	if (!target_vcpu)
+		return true;
+
+	kvm = target_vcpu->kvm;
+	local_cpu_num = READ_ONCE(kvm->arch.local_cpu_num);
+	if (!local_cpu_num)
+		return true;
+
+	return target_vcpu->vcpu_id / local_cpu_num == READ_ONCE(kvm->arch.dsm_id);
+}
+#endif
+
 static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
 {
 	struct vcpu_reset_state *reset_state;
@@ -300,27 +318,28 @@ static int kvm_psci_0_2_call(struct kvm_vcpu *vcpu)
 		kvm_psci_narrow_to_32bit(vcpu);
 		fallthrough;
 	case PSCI_0_2_FN64_CPU_ON:
-		
 		unsigned long target_mpdir = smccc_get_arg1(vcpu);
 		struct kvm_vcpu *target_vcpu;
 		target_vcpu = kvm_mpidr_to_vcpu(vcpu->kvm, target_mpdir);
-		
-		val = kvm_psci_vcpu_on(vcpu);
 #ifdef CONFIG_KVM_DSM_IRQ_FORWARD
-		vcpu->arch.dsm_irq_forward_kind = 2;
-		vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
-		vcpu->arch.dsm_irq_forward_target_id = target_vcpu->vcpu_id;
-		vcpu->arch.dsm_irq_psci_pc = smccc_get_arg2(vcpu);
-		vcpu->arch.dsm_irq_psci_r0 = smccc_get_arg3(vcpu);
-		vcpu->arch.dsm_irq_psci_be = kvm_vcpu_is_be(vcpu);
-#ifdef CONFIG_GVM_DSM_PERF_TEST
-		printk(KERN_INFO "kvm: DSM IRQ forward set by PSCI CPU_ON for source vCPU %u target vCPU %u\n",
-		       vcpu->arch.dsm_irq_forward_source_id, vcpu->arch.dsm_irq_forward_target_id);
-		printk(KERN_INFO "kvm: PSCI_0_2_FN_CPU_ON called for vCPU %u by vCPU %u\n",
-		       target_vcpu->vcpu_id, vcpu->vcpu_id);
+		if (target_vcpu && !kvm_psci_target_is_local(target_vcpu)) {
+			vcpu->arch.dsm_irq_forward_kind = 2;
+			vcpu->arch.dsm_irq_forward_source_id = vcpu->vcpu_id;
+			vcpu->arch.dsm_irq_forward_target_id = target_vcpu->vcpu_id;
+			vcpu->arch.dsm_irq_psci_pc = smccc_get_arg2(vcpu);
+			vcpu->arch.dsm_irq_psci_r0 = smccc_get_arg3(vcpu);
+			vcpu->arch.dsm_irq_psci_be = kvm_vcpu_is_be(vcpu);
+			kvm_make_request(KVM_REQ_DSM_WAKEUP_FORWARD, vcpu);
+			printk(KERN_INFO "GVM PSCI source: request forward source=%u target=%u mpidr=0x%lx pc=0x%llx r0=0x%llx be=%u\n",
+			       vcpu->vcpu_id, target_vcpu->vcpu_id, target_mpdir,
+			       vcpu->arch.dsm_irq_psci_pc,
+			       vcpu->arch.dsm_irq_psci_r0,
+			       vcpu->arch.dsm_irq_psci_be);
+			val = PSCI_RET_SUCCESS;
+			break;
+		}
 #endif
-		kvm_make_request(KVM_REQ_DSM_WAKEUP_FORWARD, vcpu);
-#endif
+		val = kvm_psci_vcpu_on(vcpu);
 		break;
 	case PSCI_0_2_FN_AFFINITY_INFO:
 		kvm_psci_narrow_to_32bit(vcpu);

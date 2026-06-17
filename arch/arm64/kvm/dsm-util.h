@@ -17,6 +17,28 @@
 #define GFN_PRESENT_MASK    (1ULL << 63)
 #define GFN_SMM_MASK        (1ULL << 62)
 
+/*
+ * ARM virt places System RAM at 0x40000000. Lower regions are pflash,
+ * ROMD or MMIO windows and must be synchronized by device-model
+ * forwarding instead of DSM page coherence.
+ */
+#define KVM_DSM_ARM_VIRT_RAM_BASE_GFN	(0x40000000ULL >> PAGE_SHIFT)
+
+static inline bool kvm_dsm_memslot_is_ram(const struct kvm_memory_slot *slot)
+{
+	if (!slot || slot->id >= KVM_USER_MEM_SLOTS ||
+	    (slot->flags & KVM_MEMSLOT_INVALID))
+		return false;
+
+	return slot->base_gfn >= KVM_DSM_ARM_VIRT_RAM_BASE_GFN;
+}
+
+static inline gfn_t kvm_dsm_encode_rmap_gfn(gfn_t gfn, bool is_smm)
+{
+	return (gfn << 1) | GFN_PRESENT_MASK |
+	       (is_smm ? GFN_SMM_MASK : 0);
+}
+
 #ifdef KVM_DSMPF_DEBUG
 #define dsmpf_debug(fmt, ...) printk(KERN_DEBUG "%s: " fmt,		\
 	__func__, ##__VA_ARGS__)
@@ -72,9 +94,19 @@ struct dsm_conn {
 
 /* mmu.c */
 extern gfn_t __kvm_dsm_vfn_to_gfn(struct kvm_dsm_memory_slot *slot,
-		hfn_t vfn, struct kvm_memory_slot *memslot);
+		bool backup, hfn_t vfn, bool *is_smm, int *iter_idx,
+		struct kvm_memory_slot *memslot);
+extern int kvm_dsm_rmap_add(struct kvm *kvm,
+		struct kvm_dsm_memory_slot *slot, bool backup,
+		gfn_t gfn, hfn_t vfn, unsigned long npages);
+extern void kvm_dsm_rmap_remove(struct kvm *kvm,
+		struct kvm_dsm_memory_slot *slot, bool backup,
+		gfn_t gfn, hfn_t vfn, unsigned long npages);
+extern void kvm_dsm_free_rmap(struct kvm *kvm,
+		struct kvm_dsm_memory_slot *slot);
 extern void kvm_dsm_apply_access_right(struct kvm *kvm,
-		struct kvm_dsm_memory_slot *slot, hfn_t vfn, unsigned long dsm_access, struct kvm_memory_slot *memslot);
+		struct kvm_dsm_memory_slot *slot, hfn_t vfn,
+		unsigned long dsm_access, struct kvm_memory_slot *memslot);
 
 static inline uint16_t generate_txid(struct kvm *kvm, uint16_t dest_id)
 {

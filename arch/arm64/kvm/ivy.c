@@ -27,11 +27,27 @@
 
 #include <linux/kthread.h>
 #include <linux/mmu_context.h>
+#include <linux/delay.h>
+#include <linux/sched/signal.h>
 
 static uint64_t dsm_page_fault_counter = 0;
 static u64 total_time=0;
 static uint64_t write_req_counter = 0;
 static uint64_t read_req_counter = 0;
+static atomic_t gvm_ivy_pf_log_count[DSM_MAX_INSTANCES];
+static atomic_t gvm_ivy_req_log_count[DSM_MAX_INSTANCES];
+
+static inline bool dsm_current_should_stop(void)
+{
+	return (current->flags & PF_KTHREAD) && kthread_should_stop();
+}
+
+static unsigned int gvm_ivy_log_node(struct kvm *kvm)
+{
+	u32 node = READ_ONCE(kvm->arch.dsm_id);
+
+	return node < DSM_MAX_INSTANCES ? node : 0;
+}
 
 enum kvm_dsm_request_type {
 	DSM_REQ_INVALIDATE,
@@ -99,6 +115,8 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 
 	if (kvm->arch.dsm_stopped)
 		return -EINVAL;
+	if (!kvm->arch.dsm_conn_socks)
+		return -EINVAL;
 
 	if (!from_server)
 		conn_sock = &kvm->arch.dsm_conn_socks[dest_id];
@@ -144,12 +162,20 @@ retry:
 		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, &tx_add);
 		if (ret == -EAGAIN) {
 			retry_cnt++;
+				if (fatal_signal_pending(current) || dsm_current_should_stop())
+					return -ERESTARTSYS;
 			if (retry_cnt > 100000) {
-				dsm_debug_v("%s: DEADLOCK kvm %d wait for gfn 0x%llx response from "
-						"kvm %d for too LONG",
-						kvm->arch.dsm_id, req->gfn, dest_id);
+				printk_ratelimited(KERN_WARNING "GVM DSM fetch_wait: node=%u dest=%u from_server=%u txid=0x%x type=%s gfn=0x%llx smm=%u retry=%d\n",
+						   READ_ONCE(kvm->arch.dsm_id),
+						   dest_id, from_server,
+						   tx_add.txid,
+						   req_desc[req->req_type],
+						   (unsigned long long)req->gfn,
+						   req->is_smm, retry_cnt);
 				retry_cnt = 0;
 			}
+			cond_resched();
+			usleep_range(1, 10);
 			goto retry;
 		}
 		resp->inv_copyset = tx_add.inv_copyset;
@@ -389,7 +415,7 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 		.version = 0,
 	};
 
-	if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped) {
+	if (dsm_is_pinned(slot, vfn) && !kvm->arch.dsm_stopped) {
 		*retry = true;
 		dsm_debug("kvm[%d] REQ_READ blocked by pinned gfn[0x%llx,%d], sleep then retry\n",
 				kvm->arch.dsm_id, req->gfn, req->is_smm);
@@ -558,6 +584,16 @@ retry_handle_req:
 			goto retry_handle_req;
 		}
 
+		if (atomic_inc_return(&gvm_ivy_req_log_count[gvm_ivy_log_node(kvm)]) <= 256)
+			printk(KERN_INFO "GVM DSM ivy_req: node=%u from=%u requester=%u type=%s gfn=0x%llx smm=%u vfn=0x%llx state=0x%x owner=%d version=%u txid=0x%x\n",
+			       READ_ONCE(kvm->arch.dsm_id), req.msg_sender,
+			       req.requester, req_desc[req.req_type],
+			       (unsigned long long)req.gfn, req.is_smm,
+			       (unsigned long long)vfn,
+			       slot->vfn_dsm_state[vfn - slot->base_vfn].state,
+			       dsm_get_prob_owner(slot, vfn),
+			       dsm_get_version(slot, vfn), tx_add.txid);
+
 		dsm_debug_v("kvm[%d] received request[0x%x] from kvm[%d->%d] req_type[%s] "
 				"gfn[%llu,%d] vfn[%llu] version %d myversion %d\n",
 				kvm->arch.dsm_id, tx_add.txid, req.msg_sender, req.requester,
@@ -614,6 +650,14 @@ retry_handle_req:
 		/* Once a request has been completed, this node isn't owner then. */
 		if (req.req_type != DSM_REQ_INVALIDATE)
 			dsm_clear_copyset(slot, vfn);
+
+		if (atomic_inc_return(&gvm_ivy_req_log_count[gvm_ivy_log_node(kvm)]) <= 256)
+			printk(KERN_INFO "GVM DSM ivy_req_done: node=%u from=%u requester=%u type=%s gfn=0x%llx retry=%u ret=%d state=0x%x owner=%d\n",
+			       READ_ONCE(kvm->arch.dsm_id), req.msg_sender,
+			       req.requester, req_desc[req.req_type],
+			       (unsigned long long)req.gfn, retry, ret,
+			       slot->vfn_dsm_state[vfn - slot->base_vfn].state,
+			       dsm_get_prob_owner(slot, vfn));
 
 		if (req.req_type != DSM_REQ_INVALIDATE)
 			dsm_unlock(kvm, slot, vfn,NULL);
@@ -726,12 +770,41 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 	char *page = NULL;
 	struct dsm_response resp;
 	int owner;
+	u32 log_node = gvm_ivy_log_node(kvm);
 
 	ret = 0;
+	if (!memslot) {
+		printk(KERN_ERR "GVM DSM ivy_pf: missing memslot node=%u gfn=0x%llx write=%d\n",
+		       READ_ONCE(kvm->arch.dsm_id),
+		       (unsigned long long)gfn, write);
+		return -EFAULT;
+	}
+	if (!kvm_dsm_memslot_is_ram(memslot))
+		return KVM_PGTABLE_PROT_RWX;
+
 	vfn = __gfn_to_vfn_memslot(memslot, gfn);
 	slot = gfn_to_hvaslot(kvm, memslot, gfn);
+	if (!slot) {
+		printk(KERN_ERR "GVM DSM ivy_pf: missing hvaslot node=%u slot=%d gfn=0x%llx vfn=0x%llx base_gfn=0x%llx npages=%lu hva=0x%llx write=%d\n",
+		       READ_ONCE(kvm->arch.dsm_id), memslot->id,
+		       (unsigned long long)gfn,
+		       (unsigned long long)vfn,
+		       (unsigned long long)memslot->base_gfn,
+		       memslot->npages,
+		       (unsigned long long)memslot->userspace_addr, write);
+		return -EFAULT;
+	}
 
 	if (is_fast_path(kvm, slot, vfn, write)) {
+		if (atomic_inc_return(&gvm_ivy_pf_log_count[log_node]) <= 256)
+			printk(KERN_INFO "GVM DSM ivy_pf: node=%u gfn=0x%llx vfn=0x%llx write=%d fast=1 state=0x%x owner=%d ret=0x%x\n",
+			       READ_ONCE(kvm->arch.dsm_id),
+			       (unsigned long long)gfn,
+			       (unsigned long long)vfn, write,
+			       slot->vfn_dsm_state[vfn - slot->base_vfn].state,
+			       dsm_get_prob_owner(slot, vfn),
+			       write ? KVM_PGTABLE_PROT_RWX :
+				       (KVM_PGTABLE_PROT_X | KVM_PGTABLE_PROT_R));
 		if (write) {
 			return KVM_PGTABLE_PROT_RWX;
 		}
@@ -920,6 +993,14 @@ out:
 
 	dsmpf_debug("handle cost: %lld \n",handle_time);
 	dsmpf_debug("avg cost: %lld \n",total_time/dsm_page_fault_counter);
+	if (atomic_inc_return(&gvm_ivy_pf_log_count[log_node]) <= 256)
+		printk(KERN_INFO "GVM DSM ivy_pf: node=%u gfn=0x%llx vfn=0x%llx write=%d fast=0 state=0x%x owner=%d resp_len=%d ret=0x%x handle_ns=%lld\n",
+		       READ_ONCE(kvm->arch.dsm_id),
+		       (unsigned long long)gfn,
+		       (unsigned long long)vfn, write,
+		       slot->vfn_dsm_state[vfn - slot->base_vfn].state,
+		       dsm_get_prob_owner(slot, vfn),
+		       resp_len, ret, handle_time);
 	kvm_dsm_pf_trace(kvm, slot, vfn, write, resp_len);
 	kfree(page);
 	

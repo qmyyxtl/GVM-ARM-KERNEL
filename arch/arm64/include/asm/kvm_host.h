@@ -13,6 +13,8 @@
 
 #include <linux/arm-smccc.h>
 #include <linux/bitmap.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/jump_label.h>
 #include <linux/kvm_types.h>
@@ -352,6 +354,7 @@ struct kvm_dsm_memory_slot {
 	// only one kvm memslot is allowed to be associated with a dsm_memslot
 	gfn_t base_gfn;
 	unsigned long npages;
+	struct hlist_head *rmap;
 	/*
 	 * gfn->vfn mapping exists in memslot. However, memslot can be modified on
 	 * the initialization period many times. Specifcally, create & delete memory
@@ -360,6 +363,8 @@ struct kvm_dsm_memory_slot {
 	 * find old vfn when new added memslot changes gfn->vfn mapping. We need to
 	 * copy old dsm state to new one to keep consistency.
 	 */
+	struct hlist_head *backup_rmap;
+	struct mutex *rmap_lock;
 	struct kvm_dsm_info *vfn_dsm_state;
 
 };
@@ -489,12 +494,16 @@ struct kvm_arch {
 	atomic_t pts;
 #endif /* TARDIS_KVM_DSM */
 
-#elif defined(CONFIG_KVM_DSM_IRQ_FORWARD)
+#endif /* CONFIG_KVM_DSM */
+
+#if defined(CONFIG_KVM_DSM_IRQ_FORWARD) && !defined(CONFIG_KVM_DSM)
 	int dsm_id;
+#endif
+
+#ifdef CONFIG_KVM_DSM_IRQ_FORWARD
 	int local_cpu_num;
 	bool dsm_tlbi_trap_enabled;
-
-#endif /* CONFIG_KVM_DSM */
+#endif
 
 #ifdef CONFIG_KVM_HISI_VIRT
 	spinlock_t sched_lock;
