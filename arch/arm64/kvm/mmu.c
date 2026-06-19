@@ -29,13 +29,72 @@
 
 static atomic_t gvm_dsm_fault_log_count[DSM_MAX_INSTANCES];
 static atomic_t gvm_dsm_map_log_count[DSM_MAX_INSTANCES];
-static atomic_t gvm_dsm_apply_log_count[DSM_MAX_INSTANCES];
+static atomic_t gvm_dsm_pfn_check_log_count[DSM_MAX_INSTANCES];
 
 static unsigned int gvm_dsm_log_node(struct kvm *kvm)
 {
 	u32 node = READ_ONCE(kvm->arch.dsm_id);
 
 	return node < DSM_MAX_INSTANCES ? node : 0;
+}
+
+static int kvm_dsm_validate_stage2_pfn(struct kvm *kvm,
+				       struct kvm_memory_slot *memslot,
+				       struct kvm_vcpu *vcpu, gfn_t gfn,
+				       kvm_pfn_t pfn, bool write_fault)
+{
+	unsigned long hva;
+	unsigned int log_node = gvm_dsm_log_node(kvm);
+	struct page *page = NULL;
+	kvm_pfn_t expected_pfn;
+	unsigned int gup_flags = write_fault ? FOLL_WRITE : 0;
+	long nr_pages;
+
+	if (!READ_ONCE(kvm->arch.dsm_enabled) || !memslot)
+		return 0;
+
+	if (!kvm_dsm_memslot_is_ram(memslot))
+		return 0;
+
+	if (gfn < memslot->base_gfn ||
+	    gfn >= memslot->base_gfn + memslot->npages)
+		return -EFAULT;
+
+	hva = memslot->userspace_addr +
+	      ((gfn - memslot->base_gfn) << PAGE_SHIFT);
+
+	if (!mmget_not_zero(kvm->mm))
+		return -EFAULT;
+
+	nr_pages = get_user_pages_remote(kvm->mm, hva, 1, gup_flags, &page,
+					 NULL);
+	mmput(kvm->mm);
+	if (nr_pages != 1) {
+		if (atomic_inc_return(&gvm_dsm_pfn_check_log_count[log_node]) <= 64)
+			printk(KERN_ERR "GVM DSM pfn check failed: node=%u vcpu=%u gfn=0x%llx hva=0x%lx pfn=0x%llx write=%u nr_pages=%ld\n",
+			       READ_ONCE(kvm->arch.dsm_id), vcpu->vcpu_id,
+			       (unsigned long long)gfn, hva,
+			       (unsigned long long)pfn, write_fault, nr_pages);
+		return -EFAULT;
+	}
+
+	expected_pfn = page_to_pfn(page);
+	put_page(page);
+
+	if (expected_pfn != pfn) {
+		if (atomic_inc_return(&gvm_dsm_pfn_check_log_count[log_node]) <= 64)
+			printk(KERN_ERR "GVM DSM pfn mismatch: node=%u vcpu=%u gfn=0x%llx hva=0x%lx pfn=0x%llx expected=0x%llx write=%u slot_base=0x%llx slot_npages=0x%llx userspace=0x%lx\n",
+			       READ_ONCE(kvm->arch.dsm_id), vcpu->vcpu_id,
+			       (unsigned long long)gfn, hva,
+			       (unsigned long long)pfn,
+			       (unsigned long long)expected_pfn, write_fault,
+			       (unsigned long long)memslot->base_gfn,
+			       (unsigned long long)memslot->npages,
+			       memslot->userspace_addr);
+		return -EFAULT;
+	}
+
+	return 0;
 }
 #endif
 
@@ -1624,9 +1683,9 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 		u32 local_start = local_cpu_num * READ_ONCE(kvm->arch.dsm_id);
 
 		dsm_log_node = gvm_dsm_log_node(kvm);
-		if (!local_cpu_num ||
+		if (dsm_trace_enabled() && (!local_cpu_num ||
 		    (vcpu->vcpu_id >= local_start &&
-		     vcpu->vcpu_id < local_start + local_cpu_num))
+		     vcpu->vcpu_id < local_start + local_cpu_num)))
 			log_dsm_fault =
 				atomic_inc_return(&gvm_dsm_fault_log_count[dsm_log_node]) <= 256;
 
@@ -1681,6 +1740,17 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 		ret = -ENOEXEC;
 		goto out_dsm_release;
 	}
+
+#ifdef CONFIG_KVM_DSM
+	if (dsm_enabled && !device) {
+		ret = kvm_dsm_validate_stage2_pfn(kvm, memslot, vcpu, gfn,
+						  pfn, write_fault);
+		if (ret) {
+			kvm_release_pfn_clean(pfn);
+			goto out_dsm_release;
+		}
+	}
+#endif
 
 	/*
 	 * Adapted from cca-v8
@@ -1767,7 +1837,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 					     KVM_PGTABLE_WALK_SHARED);
 
 #ifdef CONFIG_KVM_DSM
-	if (dsm_enabled && !device &&
+	if (dsm_enabled && !device && dsm_trace_enabled() &&
 	    atomic_inc_return(&gvm_dsm_map_log_count[dsm_log_node]) <= 256)
 		printk(KERN_INFO "GVM DSM stage2_map: node=%u vcpu=%u ipa=0x%llx gfn=0x%llx pfn=0x%llx size=0x%lx write=%u exec=%u dsm_access=0x%lx prot=0x%lx ret=%d\n",
 		       READ_ONCE(kvm->arch.dsm_id), vcpu->vcpu_id,
@@ -2759,8 +2829,6 @@ void kvm_dsm_apply_access_right(struct kvm *kvm,
 	struct kvm_memory_slot *target_slot;
 	struct hlist_head *head;
 	bool flush = false;
-	u32 log_node = gvm_dsm_log_node(kvm);
-	bool log_apply;
 
 	dsm_debug_v("kvm[%d] set vfn[%llu] to dsm_access[%lu]", kvm->arch.dsm_id,
 			vfn, dsm_access);
@@ -2772,15 +2840,13 @@ void kvm_dsm_apply_access_right(struct kvm *kvm,
 	 */
 	head = kvm_dsm_rmap_head(slot, false, vfn);
 	if (!head) {
-		if (atomic_inc_return(&gvm_dsm_apply_log_count[log_node]) <= 256)
-			printk(KERN_INFO "GVM DSM apply_access: node=%u vfn=0x%llx access=0x%lx no_rmap_head base_vfn=0x%llx npages=%lu\n",
-			       READ_ONCE(kvm->arch.dsm_id),
-			       (unsigned long long)vfn, dsm_access,
-			       (unsigned long long)slot->base_vfn, slot->npages);
+		printk_ratelimited(KERN_ERR "GVM DSM apply_access: node=%u vfn=0x%llx access=0x%lx no_rmap_head base_vfn=0x%llx npages=%lu\n",
+				   READ_ONCE(kvm->arch.dsm_id),
+				   (unsigned long long)vfn, dsm_access,
+				   (unsigned long long)slot->base_vfn,
+				   slot->npages);
 		return;
 	}
-
-	log_apply = atomic_inc_return(&gvm_dsm_apply_log_count[log_node]) <= 256;
 
 	mutex_lock(slot->rmap_lock);
 	write_lock(&kvm->mmu_lock);
@@ -2794,21 +2860,24 @@ void kvm_dsm_apply_access_right(struct kvm *kvm,
 		target_slot = __gfn_to_memslot(memslots, gfn);
 		if (!target_slot || target_slot->flags & KVM_MEMSLOT_INVALID)
 			continue;
-
-		if (log_apply)
-			printk(KERN_INFO "GVM DSM apply_access: node=%u vfn=0x%llx gfn=0x%llx access=0x%lx target_slot=%d base=0x%llx npages=%lu\n",
+		if (gfn_to_hvaslot(kvm, target_slot, gfn) != slot ||
+		    !kvm_dsm_hvaslot_matches_gfn(slot, target_slot, gfn)) {
+			printk_ratelimited(KERN_ERR
+			       "GVM DSM apply_access: skip mismatched rmap node=%u gfn=0x%llx vfn=0x%llx slot_base_gfn=0x%llx slot_base_vfn=0x%llx access=0x%lx\n",
 			       READ_ONCE(kvm->arch.dsm_id),
+			       (unsigned long long)gfn,
 			       (unsigned long long)vfn,
-			       (unsigned long long)gfn, dsm_access,
-			       target_slot->id,
-			       (unsigned long long)target_slot->base_gfn,
-			       target_slot->npages);
+			       (unsigned long long)slot->base_gfn,
+			       (unsigned long long)slot->base_vfn,
+			       dsm_access);
+			continue;
+		}
 
 		switch (dsm_access) {
 		case DSM_INVALID:
 		case DSM_MODIFIED:
-			flush |= kvm_pgtable_stage2_unmap(kvm->arch.mmu.pgt,
-							  ipa, PAGE_SIZE) > 0;
+			flush |= kvm_pgtable_stage2_clear_perms(kvm->arch.mmu.pgt,
+							       ipa, PAGE_SIZE) == 0;
 			break;
 		case DSM_SHARED:
 			flush |= kvm_pgtable_stage2_wrprotect(kvm->arch.mmu.pgt,
@@ -2821,10 +2890,6 @@ void kvm_dsm_apply_access_right(struct kvm *kvm,
     
 	if (flush)
 		kvm_flush_remote_tlbs(kvm);
-	if (log_apply)
-		printk(KERN_INFO "GVM DSM apply_access_done: node=%u vfn=0x%llx access=0x%lx flush=%u\n",
-		       READ_ONCE(kvm->arch.dsm_id),
-		       (unsigned long long)vfn, dsm_access, flush);
 	write_unlock(&kvm->mmu_lock);
 	mutex_unlock(slot->rmap_lock);
 }

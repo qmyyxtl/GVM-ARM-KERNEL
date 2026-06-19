@@ -32,6 +32,7 @@ void kvm_dsm_vcpu_release(struct kvm_vcpu *vcpu, struct kvm_memslots *slots,
 		gpa_t gpa, unsigned long len);
 
 int kvm_dsm_alloc(struct kvm *kvm);
+void kvm_dsm_stop(struct kvm *kvm);
 void kvm_dsm_free(struct kvm *kvm);
 long kvm_vm_ioctl_dsm(struct kvm *kvm, unsigned ioctl, unsigned long arg);
 

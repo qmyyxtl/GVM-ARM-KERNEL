@@ -925,11 +925,17 @@ static int kvm_mmu_notifier_test_young(struct mmu_notifier *mn,
 					     kvm_test_age_gfn);
 }
 
+void __weak kvm_arch_mmu_notifier_release(struct kvm *kvm)
+{
+}
+
 static void kvm_mmu_notifier_release(struct mmu_notifier *mn,
 				     struct mm_struct *mm)
 {
 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
 	int idx;
+
+	kvm_arch_mmu_notifier_release(kvm);
 
 	idx = srcu_read_lock(&kvm->srcu);
 	kvm_flush_shadow_all(kvm);
@@ -3116,8 +3122,6 @@ int __kvm_read_guest_page(struct kvm_memory_slot *slot, gfn_t gfn,
 	unsigned long addr;
 
 	addr = gfn_to_hva_memslot_prot(slot, gfn, NULL);
-	pr_info_ratelimited("GVM guestmem read_page slot=%p gfn=0x%llx offset=%d len=%d hva=0x%lx\n",
-			    slot, (unsigned long long)gfn, offset, len, addr);
 	if (kvm_is_error_hva(addr))
 		return -EFAULT;
 	r = __copy_from_user(data, (void __user *)addr + offset, len);
@@ -3220,8 +3224,6 @@ int __kvm_write_guest_page(struct kvm *kvm,
 	unsigned long addr;
 
 	addr = gfn_to_hva_memslot(memslot, gfn);
-	pr_info_ratelimited("GVM guestmem write_page kvm=%p slot=%p gfn=0x%llx offset=%d len=%d hva=0x%lx\n",
-			    kvm, memslot, (unsigned long long)gfn, offset, len, addr);
 	if (kvm_is_error_hva(addr))
 		return -EFAULT;
 	r = __copy_to_user((void __user *)addr + offset, data, len);

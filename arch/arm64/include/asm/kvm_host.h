@@ -293,6 +293,7 @@ typedef uint32_t timestamp_t;
 #define KVM_DSM_PF_PROFILE
 
 #define DSM_MAX_INSTANCES 16
+#define DSM_TXID_ANY (~0U)
 
 /*
  * Besides data, each transation is binded with an addtional data structure.
@@ -314,7 +315,7 @@ typedef struct tx_add {
 	 * (Hopefully) unique transcation id, which is used to eliminate the
 	 * necessity of per-socket locks.
 	 */
-	uint16_t txid;
+	uint32_t txid;
 } tx_add_t;
 
 struct kvm_dsm_info {

@@ -42,6 +42,23 @@ static inline bool dsm_current_should_stop(void)
 	return (current->flags & PF_KTHREAD) && kthread_should_stop();
 }
 
+static inline bool dsm_network_is_down(int ret)
+{
+	return ret == -ECONNRESET || ret == -EPIPE || ret == -ESHUTDOWN ||
+	       ret == -ENOTCONN || ret == -ECONNREFUSED;
+}
+
+static void kvm_dsm_mark_stopped(struct kvm *kvm, int peer, int ret)
+{
+	if (!READ_ONCE(kvm->arch.dsm_stopped))
+		printk_ratelimited(KERN_WARNING
+		       "kvm-dsm: node-%u stopping DSM after peer-%d network error %d\n",
+		       READ_ONCE(kvm->arch.dsm_id), peer, ret);
+
+	WRITE_ONCE(kvm->arch.dsm_stopped, true);
+	smp_mb();
+}
+
 static unsigned int gvm_ivy_log_node(struct kvm *kvm)
 {
 	u32 node = READ_ONCE(kvm->arch.dsm_id);
@@ -55,16 +72,23 @@ enum kvm_dsm_request_type {
 	DSM_REQ_WRITE,
 };
 static char* req_desc[3] = {"INV", "READ", "WRITE"};
+static copyset_t dsm_dummy_copyset;
 
 static inline copyset_t *dsm_get_copyset(
 		struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-	return slot->vfn_dsm_state[vfn - slot->base_vfn].copyset;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return &dsm_dummy_copyset;
+
+	return slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].copyset;
 }
 
 static inline void dsm_add_to_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vfn, int id)
 {
-	set_bit(id, slot->vfn_dsm_state[vfn - slot->base_vfn].copyset);
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	set_bit(id, slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].copyset);
 }
 
 static inline void dsm_clear_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
@@ -113,7 +137,7 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 	};
 	int retry_cnt = 0;
 
-	if (kvm->arch.dsm_stopped)
+	if (READ_ONCE(kvm->arch.dsm_stopped))
 		return -EINVAL;
 	if (!kvm->arch.dsm_conn_socks)
 		return -EINVAL;
@@ -150,19 +174,42 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 				dsm_request), 0, &tx_add);
 	if (ret < 0) {
 		dsm_debug_v("send request to kvm %d failed\n", dest_id);
+		if (dsm_network_is_down(ret))
+			kvm_dsm_mark_stopped(kvm, dest_id, ret);
 		goto done;
 	}
 
 	retry_cnt = 0;
 	if (req->req_type == DSM_REQ_INVALIDATE) {
-		ret = network_ops.receive(*conn_sock, data, 0, &tx_add);
+		char *ack_buf;
+
+		/*
+		 * The invalidate acknowledgement is one byte, but ktcp_receive()
+		 * has no destination-size argument and may copy a complete framed
+		 * payload before returning its length.  Never receive directly into
+		 * the caller's small stack object.
+		 */
+		ack_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+		if (!ack_buf)
+			return -ENOMEM;
+
+		ret = network_ops.receive(*conn_sock, ack_buf, PAGE_SIZE, 0, &tx_add);
+		if (ret == 1 && data)
+			*(char *)data = ack_buf[0];
+		else if (ret > 0)
+			printk_ratelimited(KERN_ERR
+			       "GVM DSM invalid ack length: node=%u dest=%u len=%d txid=0x%x\n",
+			       READ_ONCE(kvm->arch.dsm_id), dest_id, ret, tx_add.txid);
+		kfree(ack_buf);
 	}
 	else {
 retry:
-		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, &tx_add);
+		ret = network_ops.receive(*conn_sock, data, PAGE_SIZE, SOCK_NONBLOCK, &tx_add);
 		if (ret == -EAGAIN) {
 			retry_cnt++;
-				if (fatal_signal_pending(current) || dsm_current_should_stop())
+				if (fatal_signal_pending(current) ||
+				    dsm_current_should_stop() ||
+				    READ_ONCE(kvm->arch.dsm_stopped))
 					return -ERESTARTSYS;
 			if (retry_cnt > 100000) {
 				printk_ratelimited(KERN_WARNING "GVM DSM fetch_wait: node=%u dest=%u from_server=%u txid=0x%x type=%s gfn=0x%llx smm=%u retry=%d\n",
@@ -178,21 +225,39 @@ retry:
 			usleep_range(1, 10);
 			goto retry;
 		}
-		resp->inv_copyset = tx_add.inv_copyset;
-		resp->version = tx_add.version;
-	}
+			resp->inv_copyset = tx_add.inv_copyset;
+			resp->version = tx_add.version;
+#ifndef KVM_DSM_DIFF
+			if (ret > 0 && ret != PAGE_SIZE) {
+				printk_ratelimited(KERN_ERR
+				       "GVM DSM fetch: invalid page response node=%u dest=%u type=%s gfn=0x%llx len=%d txid=0x%x\n",
+				       READ_ONCE(kvm->arch.dsm_id), dest_id,
+				       req_desc[req->req_type],
+				       (unsigned long long)req->gfn, ret, tx_add.txid);
+				ret = -EPROTO;
+			}
+#endif
+		}
 	if (ret < 0)
 	{
 		dsm_debug_v("receive response from kvm %d failed\n", dest_id);
+		if (dsm_network_is_down(ret))
+			kvm_dsm_mark_stopped(kvm, dest_id, ret);
 		goto done;
 	}
 
 done:
-	dsm_debug_v("kvm[%d] received response[0x%x] from kvm[%d] req_type[%s] gfn[0x%llx,%d] hash: 0x%x, ret=%d",
+	if (ret > 0 && ret <= PAGE_SIZE) {
+		dsm_debug_v("kvm[%d] received response[0x%x] from kvm[%d] req_type[%s] gfn[0x%llx,%d] hash: 0x%x, ret=%d",
 			kvm->arch.dsm_id, tx_add.txid, dest_id, req_desc[req->req_type],
 			req->gfn, req->is_smm, jhash(data, ret, JHASH_INITVAL), ret);
-	const u8 *data_u8 = data;
-	dsm_debug_v("data content: %02x %02x %02x %02x %02x %02x %02x %02x\n",data_u8[0], data_u8[1], data_u8[2], data_u8[3], data_u8[4], data_u8[5], data_u8[6], data_u8[7]);
+		if (ret >= 8) {
+			const u8 *data_u8 = data;
+			dsm_debug_v("data content: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				    data_u8[0], data_u8[1], data_u8[2], data_u8[3],
+				    data_u8[4], data_u8[5], data_u8[6], data_u8[7]);
+		}
+	}
 	return ret;
 }
 
@@ -244,7 +309,8 @@ static int dsm_handle_invalidate_req(struct kvm *kvm, kconnection_t *conn_sock,
 {
 	int ret = 0;
 	char r;
-	dsmpf_debug("%d invalid %d by %d done",kvm->arch.dsm_id, req->gfn,req->msg_sender);
+	dsmpf_debug("%d invalid %llu by %d done", kvm->arch.dsm_id,
+		    (unsigned long long)req->gfn, req->msg_sender);
 	if (dsm_is_pinned(slot, vfn) && !kvm->arch.dsm_stopped) {
 		*retry = true;
 		dsm_debug("kvm[%d] REQ_INV blocked by pinned gfn[%llu,%d], sleep then retry\n",
@@ -350,6 +416,22 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 			.version = req->version,
 		};
 		owner = dsm_get_prob_owner(slot, vfn);
+		if (owner == req->msg_sender || owner == req->requester) {
+			printk_ratelimited(KERN_WARNING
+			       "GVM DSM write_req: stale owner hint node=%u gfn=0x%llx owner=%d requester=%u sender=%u state=0x%x version=%u, ack-only\n",
+			       READ_ONCE(kvm->arch.dsm_id),
+			       (unsigned long long)req->gfn, owner,
+			       req->requester, req->msg_sender,
+			       slot->vfn_dsm_state[vfn - slot->base_vfn].state,
+			       dsm_get_version(slot, vfn));
+			resp.inv_copyset = 0;
+			resp.version = dsm_get_version(slot, vfn);
+			dsm_set_prob_owner(slot, vfn, req->msg_sender);
+			dsm_change_state(slot, vfn, DSM_INVALID);
+			kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID, memslot);
+			length = 0;
+			goto send_write_resp;
+		}
 		ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, &resp);
 		if (ret < 0)
 			return ret;
@@ -372,6 +454,7 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 				req->gfn, req->version);
 	}
 
+send_write_resp:
 	tx_add->inv_copyset = resp.inv_copyset;
 	tx_add->version = resp.version;
 	ret = network_ops.send(conn_sock, page, length, 0, tx_add);
@@ -477,6 +560,22 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 			.version = req->version,
 		};
 		owner = dsm_get_prob_owner(slot, vfn);
+		if (owner == req->msg_sender || owner == req->requester) {
+			printk_ratelimited(KERN_WARNING
+			       "GVM DSM read_req: stale owner hint node=%u gfn=0x%llx owner=%d requester=%u sender=%u state=0x%x version=%u, ack-only\n",
+			       READ_ONCE(kvm->arch.dsm_id),
+			       (unsigned long long)req->gfn, owner,
+			       req->requester, req->msg_sender,
+			       slot->vfn_dsm_state[vfn - slot->base_vfn].state,
+			       dsm_get_version(slot, vfn));
+			resp.inv_copyset = 0;
+			resp.version = dsm_get_version(slot, vfn);
+			dsm_set_prob_owner(slot, vfn, req->msg_sender);
+			dsm_change_state(slot, vfn, DSM_INVALID);
+			kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID, memslot);
+			length = 0;
+			goto send_read_resp;
+		}
 		ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, &resp);
 		if (ret < 0)
 			goto out;
@@ -498,6 +597,7 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 		// printk("gvmdebug kvm[%d] encode diff (len=%d)\n", kvm->arch.dsm_id, length);
 	}
 
+send_read_resp:
 	tx_add->inv_copyset = resp.inv_copyset;
 	tx_add->version = resp.version;
 	ret = network_ops.send(conn_sock, page, length, 0, tx_add);
@@ -525,21 +625,29 @@ int ivy_kvm_dsm_handle_req(void *data)
 	struct kvm_dsm_memory_slot *slot;
 	struct dsm_request req;
 	bool retry = false;
+	bool locked = false;
+	int lock_retry_cnt = 0;
 	hfn_t vfn;
 	char comm[TASK_COMM_LEN];
 
 	char *page;
+	char *req_buf;
 	int len;
 
 	/* Size of the maximum buffer is PAGE_SIZE */
 	page = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (page == NULL)
 		return -ENOMEM;
+	req_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (req_buf == NULL) {
+		kfree(page);
+		return -ENOMEM;
+	}
 
 	while (1) {
 		tx_add_t tx_add = {
 			/* Accept any incoming requests. */
-			.txid = 0xFF,
+			.txid = DSM_TXID_ANY,
 		};
 
 		if (kthread_should_stop()) {
@@ -547,15 +655,24 @@ int ivy_kvm_dsm_handle_req(void *data)
 			goto out;
 		}
 
-		len = network_ops.receive(conn_sock, (char*)&req, 0, &tx_add);
-		BUG_ON(len > 0 && len != sizeof(struct dsm_request));
+		len = network_ops.receive(conn_sock, req_buf, PAGE_SIZE, 0, &tx_add);
 
 		if (len <= 0) {
 			ret = len;
 			goto out;
 		}
+		if (len != sizeof(struct dsm_request)) {
+			printk_ratelimited(KERN_ERR
+			       "GVM DSM bad request length: node=%u len=%d txid=0x%x\n",
+			       READ_ONCE(kvm->arch.dsm_id), len, tx_add.txid);
+			ret = -EPROTO;
+			goto out;
+		}
+		memcpy(&req, req_buf, sizeof(req));
 
 		BUG_ON(req.requester == kvm->arch.dsm_id);
+		locked = false;
+		lock_retry_cnt = 0;
 
 retry_handle_req:
 		idx = srcu_read_lock(&kvm->srcu);
@@ -583,8 +700,23 @@ retry_handle_req:
 			schedule();
 			goto retry_handle_req;
 		}
+		if (!kvm_dsm_hvaslot_matches_gfn(slot, memslot, req.gfn)) {
+			printk_ratelimited(KERN_ERR
+			       "GVM DSM ivy_req: hvaslot mismatch node=%u from=%u type=%s gfn=0x%llx vfn=0x%llx slot_base_gfn=0x%llx slot_base_vfn=0x%llx npages=%lu txid=0x%x\n",
+			       READ_ONCE(kvm->arch.dsm_id), req.msg_sender,
+			       req_desc[req.req_type],
+			       (unsigned long long)req.gfn,
+			       (unsigned long long)vfn,
+			       (unsigned long long)slot->base_gfn,
+			       (unsigned long long)slot->base_vfn,
+			       slot->npages, tx_add.txid);
+			srcu_read_unlock(&kvm->srcu, idx);
+			ret = -EFAULT;
+			goto out;
+		}
 
-		if (atomic_inc_return(&gvm_ivy_req_log_count[gvm_ivy_log_node(kvm)]) <= 256)
+		if (dsm_trace_enabled() &&
+		    atomic_inc_return(&gvm_ivy_req_log_count[gvm_ivy_log_node(kvm)]) <= 256)
 			printk(KERN_INFO "GVM DSM ivy_req: node=%u from=%u requester=%u type=%s gfn=0x%llx smm=%u vfn=0x%llx state=0x%x owner=%d version=%u txid=0x%x\n",
 			       READ_ONCE(kvm->arch.dsm_id), req.msg_sender,
 			       req.requester, req_desc[req.req_type],
@@ -616,7 +748,18 @@ retry_handle_req:
 		 * request and finds whether there's some more requests.
 		 */
 		if (req.req_type != DSM_REQ_INVALIDATE) {
-			dsm_lock(kvm, slot, vfn,NULL);
+			ret = dsm_trylock_timeout(kvm, slot, vfn,
+						  &lock_retry_cnt, memslot);
+			if (ret == -EAGAIN) {
+				srcu_read_unlock(&kvm->srcu, idx);
+				cond_resched();
+				goto retry_handle_req;
+			}
+			if (ret < 0) {
+				srcu_read_unlock(&kvm->srcu, idx);
+				goto out;
+			}
+			locked = true;
 		}
 
 		switch (req.req_type) {
@@ -648,10 +791,11 @@ retry_handle_req:
 		}
 
 		/* Once a request has been completed, this node isn't owner then. */
-		if (req.req_type != DSM_REQ_INVALIDATE)
+		if (req.req_type != DSM_REQ_INVALIDATE && !retry)
 			dsm_clear_copyset(slot, vfn);
 
-		if (atomic_inc_return(&gvm_ivy_req_log_count[gvm_ivy_log_node(kvm)]) <= 256)
+		if (dsm_trace_enabled() &&
+		    atomic_inc_return(&gvm_ivy_req_log_count[gvm_ivy_log_node(kvm)]) <= 256)
 			printk(KERN_INFO "GVM DSM ivy_req_done: node=%u from=%u requester=%u type=%s gfn=0x%llx retry=%u ret=%d state=0x%x owner=%d\n",
 			       READ_ONCE(kvm->arch.dsm_id), req.msg_sender,
 			       req.requester, req_desc[req.req_type],
@@ -659,8 +803,10 @@ retry_handle_req:
 			       slot->vfn_dsm_state[vfn - slot->base_vfn].state,
 			       dsm_get_prob_owner(slot, vfn));
 
-		if (req.req_type != DSM_REQ_INVALIDATE)
+		if (locked) {
 			dsm_unlock(kvm, slot, vfn,NULL);
+			locked = false;
+		}
 
 		srcu_read_unlock(&kvm->srcu, idx);
 
@@ -671,10 +817,11 @@ retry_handle_req:
 		}
 	}
 out_unlock:
-	if (req.req_type != DSM_REQ_INVALIDATE)
+	if (locked)
 		dsm_unlock(kvm, slot, vfn,NULL);
 	srcu_read_unlock(&kvm->srcu, idx);
 out:
+	kfree(req_buf);
 	kfree(page);
 	/* return zero since we quit voluntarily */
 	if (kvm->arch.dsm_stopped) {
@@ -773,6 +920,9 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 	u32 log_node = gvm_ivy_log_node(kvm);
 
 	ret = 0;
+	if (READ_ONCE(kvm->arch.dsm_stopped))
+		return KVM_PGTABLE_PROT_RWX;
+
 	if (!memslot) {
 		printk(KERN_ERR "GVM DSM ivy_pf: missing memslot node=%u gfn=0x%llx write=%d\n",
 		       READ_ONCE(kvm->arch.dsm_id),
@@ -796,7 +946,8 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 	}
 
 	if (is_fast_path(kvm, slot, vfn, write)) {
-		if (atomic_inc_return(&gvm_ivy_pf_log_count[log_node]) <= 256)
+		if (dsm_trace_enabled() &&
+		    atomic_inc_return(&gvm_ivy_pf_log_count[log_node]) <= 256)
 			printk(KERN_INFO "GVM DSM ivy_pf: node=%u gfn=0x%llx vfn=0x%llx write=%d fast=1 state=0x%x owner=%d ret=0x%x\n",
 			       READ_ONCE(kvm->arch.dsm_id),
 			       (unsigned long long)gfn,
@@ -903,12 +1054,12 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		dsm_clear_copyset(slot, vfn);
 		dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
 
-		dsm_decode_diff(page, resp_len, memslot, gfn);
-		dsm_set_twin_conditionally(slot, vfn, page, memslot, gfn,
+		dsm_decode_diff(kvm, page, resp_len, memslot, gfn);
+		dsm_set_twin_conditionally(kvm, slot, vfn, page, memslot, gfn,
 				dsm_is_owner(slot, vfn), resp.version);
 
 		if (!dsm_is_owner(slot, vfn) && resp_len > 0) {
-			ret = __kvm_write_guest_page(kvm, memslot, gfn, page, 0, PAGE_SIZE);
+			ret = kvm_dsm_write_guest_page(kvm, memslot, gfn, page, 0, PAGE_SIZE);
 			if (ret < 0) {
 				dsm_debug_v("kvm write guest page error");
 				goto out_error;
@@ -967,11 +1118,18 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		memcpy(dsm_get_copyset(slot, vfn), &resp.inv_copyset, sizeof(copyset_t));
 		dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
 
-		dsm_decode_diff(page, resp_len, memslot, gfn);
-		ret = __kvm_write_guest_page(kvm,memslot, gfn, page, 0, PAGE_SIZE);
-		if (ret < 0){
-			dsm_debug_v("kvm write guest page error");
-			goto out_error;
+		dsm_decode_diff(kvm, page, resp_len, memslot, gfn);
+		if (resp_len > 0) {
+			ret = kvm_dsm_write_guest_page(kvm, memslot, gfn, page, 0, PAGE_SIZE);
+			if (ret < 0) {
+				dsm_debug_v("kvm write guest page error");
+				goto out_error;
+			}
+		} else if (dsm_trace_enabled() &&
+			   atomic_inc_return(&gvm_ivy_pf_log_count[log_node]) <= 256) {
+			printk(KERN_INFO "GVM DSM ivy_pf: node=%u gfn=0x%llx read response ack-only version=%u\n",
+			       READ_ONCE(kvm->arch.dsm_id),
+			       (unsigned long long)gfn, resp.version);
 		}
 		dsm_set_prob_owner(slot, vfn, kvm->arch.dsm_id);
 		dsm_debug_v("kvm[%d](after __kvm_write_guest_page) change owner of gfn[%llu,%d] "
@@ -993,7 +1151,8 @@ out:
 
 	dsmpf_debug("handle cost: %lld \n",handle_time);
 	dsmpf_debug("avg cost: %lld \n",total_time/dsm_page_fault_counter);
-	if (atomic_inc_return(&gvm_ivy_pf_log_count[log_node]) <= 256)
+	if (dsm_trace_enabled() &&
+	    atomic_inc_return(&gvm_ivy_pf_log_count[log_node]) <= 256)
 		printk(KERN_INFO "GVM DSM ivy_pf: node=%u gfn=0x%llx vfn=0x%llx write=%d fast=0 state=0x%x owner=%d resp_len=%d ret=0x%x handle_ns=%lld\n",
 		       READ_ONCE(kvm->arch.dsm_id),
 		       (unsigned long long)gfn,
@@ -1007,6 +1166,12 @@ out:
 	return ret;
 
 out_error:
+	if (READ_ONCE(kvm->arch.dsm_stopped) ||
+	    ret == -ERESTARTSYS || ret == -EINTR ||
+	    ret == -EPIPE || ret == -ESHUTDOWN) {
+		kfree(page);
+		return KVM_PGTABLE_PROT_RWX;
+	}
 	dump_stack();
 	printk(KERN_ERR "kvm-dsm: node-%d failed to handle page fault on gfn[%llu,%d], "
 			"error: %d\n", kvm->arch.dsm_id, gfn, is_smm, ret);

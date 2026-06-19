@@ -1250,6 +1250,7 @@ void kvm_arch_commit_memory_region(struct kvm *kvm,
 				enum kvm_mr_change change);
 /* flush all memory translations */
 void kvm_arch_flush_shadow_all(struct kvm *kvm);
+void kvm_arch_mmu_notifier_release(struct kvm *kvm);
 /* flush memory translations pointing to 'slot' */
 void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
 				   struct kvm_memory_slot *slot);

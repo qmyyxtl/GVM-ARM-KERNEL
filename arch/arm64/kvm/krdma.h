@@ -44,7 +44,7 @@ void krdma_config(size_t max_buf_size);
 int krdma_send(struct krdma_cb *cb, const char *buffer, size_t length,
 		unsigned long flag, const tx_add_t *tx_add);
 
-int krdma_receive(struct krdma_cb *cb, char *buffer, unsigned long flag,
+int krdma_receive(struct krdma_cb *cb, char *buffer, size_t buffer_len, unsigned long flag,
 		tx_add_t *tx_add);
 
 int krdma_connect(const char *host, const char *port, struct krdma_cb **conn_cb);

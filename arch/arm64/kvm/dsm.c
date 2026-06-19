@@ -31,6 +31,9 @@ bool kvm_dsm_dbg_verbose = 0;
 static atomic_t gvm_dsm_hvaslot_miss_log_count[DSM_MAX_INSTANCES];
 static atomic_t gvm_dsm_memslot_log_count[DSM_MAX_INSTANCES];
 static atomic_t gvm_dsm_skip_nonram_log_count[DSM_MAX_INSTANCES];
+static atomic_t gvm_dsm_vma_log_count[DSM_MAX_INSTANCES];
+static atomic_t gvm_dsm_memcpy_bad_range_log_count[DSM_MAX_INSTANCES];
+static atomic_t gvm_dsm_memcpy_log_count[DSM_MAX_INSTANCES];
 
 static unsigned int gvm_dsm_log_node(struct kvm *kvm)
 {
@@ -48,6 +51,9 @@ static void kvm_dsm_log_skip_nonram(struct kvm *kvm,
 {
 	u32 node = gvm_dsm_log_node(kvm);
 
+	if (!dsm_trace_enabled())
+		return;
+
 	if (atomic_inc_return(&gvm_dsm_skip_nonram_log_count[node]) > 128)
 		return;
 
@@ -57,8 +63,53 @@ static void kvm_dsm_log_skip_nonram(struct kvm *kvm,
 	       (unsigned long long)gfn,
 	       slot ? (unsigned long long)slot->base_gfn : 0,
 	       slot ? slot->npages : 0,
-	       slot ? (unsigned long long)slot->userspace_addr : 0,
-	       slot ? (unsigned long)slot->flags : 0);
+		       slot ? (unsigned long long)slot->userspace_addr : 0,
+		       slot ? (unsigned long)slot->flags : 0);
+}
+
+static void kvm_dsm_log_memslot_vma(struct kvm *kvm,
+				    const struct kvm_memory_slot *slot,
+				    int as_id, const char *where)
+{
+	struct vm_area_struct *vma;
+	unsigned long hva;
+	u32 node = gvm_dsm_log_node(kvm);
+	const char *name = "<anon>";
+	unsigned long vm_flags = 0;
+	unsigned long vm_start = 0;
+	unsigned long vm_end = 0;
+	unsigned long ino = 0;
+
+	if (!dsm_trace_enabled() ||
+	    !slot || atomic_inc_return(&gvm_dsm_vma_log_count[node]) > 64)
+		return;
+
+	hva = slot->userspace_addr;
+	if (!mmget_not_zero(kvm->mm))
+		return;
+
+	mmap_read_lock(kvm->mm);
+	vma = vma_lookup(kvm->mm, hva);
+	if (vma) {
+		vm_flags = vma->vm_flags;
+		vm_start = vma->vm_start;
+		vm_end = vma->vm_end;
+		if (vma->vm_file) {
+			name = vma->vm_file->f_path.dentry->d_name.name;
+			ino = file_inode(vma->vm_file)->i_ino;
+		}
+	} else {
+		name = "<no-vma>";
+	}
+	printk(KERN_INFO
+	       "GVM DSM memslot vma: node=%u where=%s as=%d id=%d gfn=0x%llx npages=%lu hva=0x%llx flags=0x%lx vma=[0x%lx,0x%lx) vm_flags=0x%lx file=%s ino=%lu\n",
+	       READ_ONCE(kvm->arch.dsm_id), where, as_id, slot->id,
+	       (unsigned long long)slot->base_gfn, slot->npages,
+	       (unsigned long long)slot->userspace_addr,
+	       (unsigned long)slot->flags, vm_start, vm_end, vm_flags,
+	       name, ino);
+	mmap_read_unlock(kvm->mm);
+	mmput(kvm->mm);
 }
 
 /*
@@ -79,6 +130,7 @@ int kvm_dsm_register_memslot_hva(struct kvm *kvm, struct kvm_memory_slot *slot,
 					"register_hva");
 		return 0;
 	}
+	kvm_dsm_log_memslot_vma(kvm, slot, -1, "register_hva");
 
 	slots = kvm_kvzalloc(sizeof(struct kvm_dsm_memslots));
 	if (!slots)
@@ -101,7 +153,9 @@ int kvm_dsm_register_memslot_hva(struct kvm *kvm, struct kvm_memory_slot *slot,
 			if (start == end)
 				continue;
 		}
-		ret = insert_hvaslot(slots, i, start, end - start);
+		ret = insert_hvaslot(slots, i, start,
+				     slot->base_gfn + (start - base_vfn),
+				     end - start);
 		if (ret < 0)
 			goto out_free;
 	}
@@ -115,13 +169,19 @@ int kvm_dsm_register_memslot_hva(struct kvm *kvm, struct kvm_memory_slot *slot,
 		end = base_vfn + npages;
 	}
 	if (end > start) {
-		ret = insert_hvaslot(slots, old_slots->used_slots, start, end - start);
+		ret = insert_hvaslot(slots, old_slots->used_slots, start,
+				     slot->base_gfn + (start - base_vfn),
+				     end - start);
 		if (ret < 0)
 			goto out_free;
 	}
 
 	rcu_assign_pointer(kvm->arch.dsm_hvaslots, slots);
 	synchronize_srcu_expedited(&kvm->srcu);
+	printk(KERN_INFO "GVM DSM hvaslot register: node=%u slot=%d base_gfn=0x%llx npages=%lu base_vfn=0x%llx hvaslots=%d\n",
+	       READ_ONCE(kvm->arch.dsm_id), slot->id,
+	       (unsigned long long)slot->base_gfn, slot->npages,
+	       (unsigned long long)base_vfn, slots->used_slots);
 	kvfree(old_slots);
 	return 0;
 
@@ -151,6 +211,7 @@ int kvm_dsm_add_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
 					"add_memslot");
 		return 0;
 	}
+	kvm_dsm_log_memslot_vma(kvm, slot, as_id, "add_memslot");
 
 	gfn_end = slot->base_gfn + slot->npages;
 	slots = __kvm_hvaslots(kvm);
@@ -340,6 +401,7 @@ static int kvm_dsm_register_existing_memslots(struct kvm *kvm)
 				goto out_unlock;
 
 			registered++;
+			kvm_dsm_log_memslot_vma(kvm, slot, as_id, "init");
 			printk(KERN_INFO "GVM DSM memslot init: node=%u as=%d id=%d gfn=0x%llx npages=%lu hva=0x%llx\n",
 			       READ_ONCE(kvm->arch.dsm_id), as_id, slot->id,
 			       (unsigned long long)slot->base_gfn,
@@ -369,8 +431,9 @@ static int __kvm_dsm_acquire_page(struct kvm *kvm,
 	hfn_t vfn;
 	int dsm_access;
 
-	if (WARN_ON(kvm->mm != current->mm)){
-		printk("dsm_acquire_abnormal");
+	if (WARN_ON(kvm->mm != current->mm)) {
+		printk(KERN_ERR "GVM DSM acquire: unexpected mm context node=%u gfn=0x%llx\n",
+		       READ_ONCE(kvm->arch.dsm_id), (unsigned long long)gfn);
 		return -EINVAL;
 	}
 	if (!kvm->arch.dsm_enabled){
@@ -408,6 +471,17 @@ static int __kvm_dsm_acquire_page(struct kvm *kvm,
 			       (unsigned long long)slot->userspace_addr,
 			       __kvm_hvaslots(kvm)->used_slots, write);
 		return KVM_PGTABLE_PROT_RWX;
+	}
+	if (!kvm_dsm_hvaslot_matches_gfn(hvaslot, slot, gfn)) {
+		printk_ratelimited(KERN_ERR
+		       "GVM DSM acquire: hvaslot mismatch node=%u slot=%d gfn=0x%llx vfn=0x%llx hvaslot_base_gfn=0x%llx hvaslot_base_vfn=0x%llx npages=%lu write=%u\n",
+		       READ_ONCE(kvm->arch.dsm_id), slot->id,
+		       (unsigned long long)gfn,
+		       (unsigned long long)vfn,
+		       (unsigned long long)hvaslot->base_gfn,
+		       (unsigned long long)hvaslot->base_vfn,
+		       hvaslot->npages, write);
+		return -EFAULT;
 	}
 	// printk("dsm_lock vfn %llx, hvaslot_vfn %llx", vfn, hvaslot->base_vfn);
 
@@ -466,6 +540,17 @@ void kvm_dsm_release_page(struct kvm *kvm, struct kvm_memory_slot *slot,
 	hvaslot = gfn_to_hvaslot(kvm, slot, gfn);
 	if (!hvaslot)
 		return;
+	if (!kvm_dsm_hvaslot_matches_gfn(hvaslot, slot, gfn)) {
+		printk_ratelimited(KERN_ERR
+		       "GVM DSM release: hvaslot mismatch node=%u slot=%d gfn=0x%llx vfn=0x%llx hvaslot_base_gfn=0x%llx hvaslot_base_vfn=0x%llx npages=%lu\n",
+		       READ_ONCE(kvm->arch.dsm_id), slot->id,
+		       (unsigned long long)gfn,
+		       (unsigned long long)vfn,
+		       (unsigned long long)hvaslot->base_gfn,
+		       (unsigned long long)hvaslot->base_vfn,
+		       hvaslot->npages);
+		return;
+	}
 	// printk("kvm_dsm_release_page 336");
 	dsm_unlock_fast_path(hvaslot, vfn, false);
 	dsm_unlock(kvm, hvaslot, vfn,NULL);
@@ -611,8 +696,8 @@ static int kvm_dsm_threadfn(void *data)
 
 	dsm_debug_v("kvm[%d] started dsm server on %s:%s\n", kvm->arch.dsm_id,
 			addr.host, addr.port);
-	printk("kvm[%d] started dsm server on %s:%s\n", kvm->arch.dsm_id,
-			addr.host, addr.port);
+	dsm_trace_info("kvm[%d] started dsm server on %s:%s\n",
+		       kvm->arch.dsm_id, addr.host, addr.port);
 	count = 0;
 	while (1) {
 		if (kthread_should_stop()) {
@@ -626,7 +711,7 @@ static int kvm_dsm_threadfn(void *data)
 				ret = 0;
 			goto out_listen_sock;
 		}
-		conn = kmalloc(sizeof(struct dsm_conn), GFP_KERNEL);
+		conn = kzalloc(sizeof(struct dsm_conn), GFP_KERNEL);
 		if (conn == NULL) {
 			ret = -ENOMEM;
 			goto out_accept_sock;
@@ -659,13 +744,22 @@ out_listen_sock:
 		conn = list_first_entry(&conn_list, struct dsm_conn, link);
 		list_del(&conn->link);
 		for (i = 0; i < NDSM_CONN_THREADS; i++) {
-			get_task_comm(comm, conn->threads[i]);
+			if (!conn->threads[i])
+				continue;
 			send_sig(SIGKILL, conn->threads[i], 1);
+		}
+		if (network_ops.shutdown)
+			network_ops.shutdown(conn->sock);
+		for (i = 0; i < NDSM_CONN_THREADS; i++) {
+			if (!conn->threads[i])
+				continue;
+			get_task_comm(comm, conn->threads[i]);
 			ret = kthread_stop(conn->threads[i]);
 			dsm_debug("kvm[%d] dsm connection thread %s exited with %d",
 					kvm->arch.dsm_id, comm, ret);
-			printk("kvm[%d] dsm connection thread %s exited with %d",
-					kvm->arch.dsm_id, comm, ret);
+			if (ret)
+				printk(KERN_ERR "kvm[%d] dsm connection thread %s exited with %d\n",
+				       kvm->arch.dsm_id, comm, ret);
 		}
 		network_ops.release(conn->sock);
 		kfree(conn);
@@ -686,7 +780,8 @@ out_listen_sock:
 
 	network_ops.release(listen_sock);
 
-	kvm_dsm_report_profile(kvm);
+	if (dsm_trace_enabled())
+		kvm_dsm_report_profile(kvm);
 	clean_couter();
 // printk("544 ,%d\n",ret);
 	return ret;
@@ -694,7 +789,6 @@ out_listen_sock:
 
 static int kvm_dsm_init(struct kvm *kvm, struct kvm_dsm_params *params)
 {
-	printk("kvm_dsm_init");
 	int ret = 0;
 	struct task_struct *thread;
 	int i;
@@ -749,6 +843,7 @@ static int kvm_dsm_init(struct kvm *kvm, struct kvm_dsm_params *params)
 	network_ops.connect = ktcp_connect;
 	network_ops.listen = ktcp_listen;
 	network_ops.accept = ktcp_accept;
+	network_ops.shutdown = ktcp_shutdown;
 	network_ops.release = ktcp_release;
 	dsm_debug("%s: kvm %d use TCP connection\n", __func__, params->dsm_id);
 #endif
@@ -759,6 +854,7 @@ static int kvm_dsm_init(struct kvm *kvm, struct kvm_dsm_params *params)
 	network_ops.connect = krdma_connect;
 	network_ops.listen = krdma_listen;
 	network_ops.accept = krdma_accept;
+	network_ops.shutdown = NULL;
 	network_ops.release = krdma_release;
 	dsm_debug("%s: kvm %d use RDMA connection\n", __func__, params->dsm_id);
 #endif
@@ -810,42 +906,61 @@ int kvm_dsm_alloc(struct kvm *kvm)
 	return 0;
 }
 
+void kvm_dsm_stop(struct kvm *kvm)
+{
+	struct task_struct *thread;
+	int ret;
+
+	if (!kvm->arch.dsm_enabled)
+		return;
+
+	WRITE_ONCE(kvm->arch.dsm_stopped, true);
+	smp_mb();
+
+	thread = xchg(&kvm->arch.dsm_thread, NULL);
+	if (!thread)
+		return;
+
+	printk(KERN_INFO "kvm-dsm: node-%d stopping dsm server\n",
+	       kvm->arch.dsm_id);
+#ifdef TARDIS_KVM_DSM
+	send_sig(SIGKILL, kvm->arch.expiration_timer_thread, 1);
+	ret = kthread_stop(kvm->arch.expiration_timer_thread);
+	if (ret < 0)
+		printk(KERN_ERR "%s: node-%d dsm expiration timer exited with %d\n",
+		       __func__, kvm->arch.dsm_id, ret);
+#endif
+	send_sig(SIGKILL, thread, 1);
+	ret = kthread_stop(thread);
+	if (ret < 0)
+		printk(KERN_ERR "%s: node-%d dsm root server exited with %d\n",
+		       __func__, kvm->arch.dsm_id, ret);
+#ifdef TARDIS_KVM_DSM
+	cleanup_srcu_struct(&kvm->arch.expiration_list_srcu);
+#endif
+}
+
 void kvm_dsm_free(struct kvm *kvm)
 {
-	int ret, i;
+	int i, used_slots;
 	struct kvm_dsm_memslots *slots;
 
-	if (kvm->arch.dsm_enabled && kvm->arch.dsm_thread != NULL) {
-		printk(KERN_INFO "kvm-dsm: node-%d stopping dsm server\n", kvm->arch.dsm_id);
-		kvm->arch.dsm_stopped = true;
-		smp_mb();
-#ifdef TARDIS_KVM_DSM
-		send_sig(SIGKILL, kvm->arch.expiration_timer_thread, 1);
-		ret = kthread_stop(kvm->arch.expiration_timer_thread);
-		if (ret < 0) {
-			printk(KERN_ERR "%s: node-%d dsm expiration timer exited with %d\n",
-					__func__, kvm->arch.dsm_id, ret);
-		}
-#endif
-		send_sig(SIGKILL, kvm->arch.dsm_thread, 1);
-		ret = kthread_stop(kvm->arch.dsm_thread);
-		if (ret < 0) {
-			printk(KERN_ERR "%s: node-%d dsm root server exited with %d\n",
-					__func__, kvm->arch.dsm_id, ret);
-		}
-#ifdef TARDIS_KVM_DSM
-		cleanup_srcu_struct(&kvm->arch.expiration_list_srcu);
-#endif
-		for (i = 0; i < kvm->arch.cluster_iplist_len; i ++)
+	kvm_dsm_stop(kvm);
+
+	if (kvm->arch.dsm_enabled) {
+		for (i = 0; i < kvm->arch.cluster_iplist_len; i++)
 			kfree(kvm->arch.cluster_iplist[i]);
 		kfree(kvm->arch.cluster_iplist);
+		kvm->arch.cluster_iplist = NULL;
+		kvm->arch.cluster_iplist_len = 0;
 	}
 
 	slots = kvm->arch.dsm_hvaslots;
 	if (!slots)
 		return;
 
-	for (i = 0; i < KVM_MEM_SLOTS_NUM; i++) {
+	used_slots = slots->used_slots;
+	for (i = 0; i < used_slots; i++) {
 #ifdef KVM_DSM_DIFF
 		unsigned long j;
 		for (j = 0; j < slots->memslots[i].npages; j++) {
@@ -855,6 +970,7 @@ void kvm_dsm_free(struct kvm *kvm)
 		kvm_dsm_free_rmap(kvm, &slots->memslots[i]);
 		kvfree(slots->memslots[i].vfn_dsm_state);
 	}
+	RCU_INIT_POINTER(kvm->arch.dsm_hvaslots, NULL);
 	kvfree(slots);
 }
 
@@ -882,6 +998,52 @@ static int kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 	return ret;
 }
 
+static int kvm_dsm_copy_user_range(struct kvm *kvm, unsigned long dst,
+				   unsigned long src, unsigned long len)
+{
+	unsigned long copied = 0;
+	void *buf;
+	int ret = 0;
+
+	if (!len)
+		return 0;
+
+	if (!mmget_not_zero(kvm->mm))
+		return -EFAULT;
+
+	buf = (void *)__get_free_page(GFP_KERNEL);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto out_mm;
+	}
+
+	while (copied < len) {
+		unsigned long chunk = min_t(unsigned long, PAGE_SIZE,
+					    len - copied);
+		int done;
+
+		done = access_remote_vm(kvm->mm, src + copied, buf, chunk, 0);
+		if (done != chunk) {
+			ret = -EFAULT;
+			break;
+		}
+
+		done = access_remote_vm(kvm->mm, dst + copied, buf, chunk,
+					FOLL_WRITE);
+		if (done != chunk) {
+			ret = -EFAULT;
+			break;
+		}
+
+		copied += chunk;
+	}
+
+	free_page((unsigned long)buf);
+out_mm:
+	mmput(kvm->mm);
+	return ret;
+}
+
 int kvm_dsm_memcpy(struct kvm *kvm, unsigned long host_virt_addr,
 		unsigned long userspace_addr, unsigned long length, bool write)
 {
@@ -898,6 +1060,16 @@ int kvm_dsm_memcpy(struct kvm *kvm, unsigned long host_virt_addr,
 		return -EFAULT;
 	if (!kvm->arch.dsm_enabled)
 		return -EINVAL;
+	if (!length || host_virt_addr + length < host_virt_addr ||
+	    userspace_addr + length < userspace_addr)
+		return -EINVAL;
+
+	if (atomic_inc_return(&gvm_dsm_memcpy_log_count[gvm_dsm_log_node(kvm)]) <= 64)
+		printk(KERN_INFO
+		       "GVM DSM memcpy call: node=%u comm=%s host_hva=0x%lx user_hva=0x%lx len=%lu write=%u current_mm=%p kvm_mm=%p\n",
+		       READ_ONCE(kvm->arch.dsm_id), current->comm,
+		       host_virt_addr, userspace_addr, length, write,
+		       current->mm, kvm->mm);
 
 	dsm_debug_v("hva %lx, length %lu, write %d\n", host_virt_addr, length, write);
 	idx = srcu_read_lock(&kvm->srcu);
@@ -905,10 +1077,16 @@ int kvm_dsm_memcpy(struct kvm *kvm, unsigned long host_virt_addr,
 	vfn_end = ((host_virt_addr + length - 1) >> PAGE_SHIFT) + 1;
 	for (vfn = host_virt_addr >> PAGE_SHIFT; vfn < vfn_end; vfn += npages) {
 		slot = vfn_to_hvaslot(kvm, vfn);
-		/* for private memslots, do memcpy directly without DSM fetching */
 		if (!slot) {
-			npages = 1;
-			goto do_memcpy;
+			u32 node = gvm_dsm_log_node(kvm);
+
+			if (atomic_inc_return(&gvm_dsm_memcpy_bad_range_log_count[node]) <= 64)
+				printk(KERN_ERR "GVM DSM memcpy: HVA is not DSM RAM node=%u hva=0x%lx user=0x%lx len=%lu write=%u vfn=0x%llx\n",
+				       READ_ONCE(kvm->arch.dsm_id), host_virt_addr,
+				       userspace_addr, length, write,
+				       (unsigned long long)vfn);
+			ret = -EFAULT;
+			goto out;
 		}
 		npages = min(vfn_end - vfn, slot->base_vfn + slot->npages - vfn);
 
@@ -921,6 +1099,21 @@ int kvm_dsm_memcpy(struct kvm *kvm, unsigned long host_virt_addr,
 			gfn = __kvm_dsm_vfn_to_gfn(slot, false, vfn + i,
 						   NULL, NULL, NULL);
 			memslot = __gfn_to_memslot(__kvm_memslots(kvm, 0), gfn);
+			if (!memslot || memslot->id >= KVM_USER_MEM_SLOTS ||
+			    (memslot->flags & KVM_MEMSLOT_INVALID) ||
+			    gfn < memslot->base_gfn ||
+			    gfn >= memslot->base_gfn + memslot->npages) {
+				u32 node = gvm_dsm_log_node(kvm);
+
+				if (atomic_inc_return(&gvm_dsm_memcpy_bad_range_log_count[node]) <= 64)
+					printk(KERN_ERR "GVM DSM memcpy: invalid rmap gfn node=%u hva=0x%lx len=%lu write=%u vfn=0x%llx gfn=0x%llx memslot=%px\n",
+					       READ_ONCE(kvm->arch.dsm_id),
+					       host_virt_addr, length, write,
+					       (unsigned long long)(vfn + i),
+					       (unsigned long long)gfn, memslot);
+				ret = -EFAULT;
+				goto out_unlock;
+			}
 			gfn_npages = min(npages - i, (unsigned long)(memslot->base_gfn +
 						memslot->npages - gfn));
 			for (j = 0; j < gfn_npages; j++) {
@@ -930,25 +1123,20 @@ int kvm_dsm_memcpy(struct kvm *kvm, unsigned long host_virt_addr,
 			}
 		}
 
-do_memcpy:
 		hva_start = max(host_virt_addr, (unsigned long)(vfn << PAGE_SHIFT));
 		user_buf = (void *)(userspace_addr + hva_start - host_virt_addr);
-		if (slot) {
-			hva_end = min(host_virt_addr + length, (unsigned long)
-					(slot->base_vfn + slot->npages) << PAGE_SHIFT);
-		} else {
-			hva_end = min(host_virt_addr + length, (unsigned long)
-					(vfn + 1) << PAGE_SHIFT);
-		}
-		/* This is actually an user-to-user memcpy, but as we are sure that
-		 * hva is valid, we can treat it as kernel memory. */
-		l = hva_end - hva_start;
-		if (write)
-			ret = __copy_from_user((void *)hva_start, user_buf, l);
-		else
-			ret = __copy_to_user(user_buf, (void *)hva_start, l);
-		if (!slot)
-			continue;
+			if (slot) {
+				hva_end = min(host_virt_addr + length, (unsigned long)
+						(slot->base_vfn + slot->npages) << PAGE_SHIFT);
+			}
+				l = hva_end - hva_start;
+				if (write)
+					ret = kvm_dsm_copy_user_range(kvm, hva_start,
+								      (unsigned long)user_buf, l);
+			else
+				ret = kvm_dsm_copy_user_range(kvm,
+							      (unsigned long)user_buf,
+							      hva_start, l);
 
 out_unlock:
 		for (i = 0; i < npages; i++) {
@@ -967,15 +1155,16 @@ out:
 int kvm_dsm_mempin(struct kvm *kvm, unsigned long host_virt_addr,
 		unsigned long length, bool write, bool unpin)
 {
-	printk_ratelimited(KERN_INFO "GVM DSM mempin: node=%u hva=0x%lx len=%lu write=%u unpin=%u\n",
-			   READ_ONCE(kvm->arch.dsm_id), host_virt_addr,
-			   length, write, unpin);
 	struct kvm_dsm_memory_slot *slot;
 	struct kvm_memory_slot *memslot;
 	hfn_t vfn, vfn_end;
 	gfn_t gfn;
 	unsigned long npages, gfn_npages, i, j;
 	int idx, ret = 0;
+
+	dsm_trace_info("GVM DSM mempin: node=%u hva=0x%lx len=%lu write=%u unpin=%u\n",
+		       READ_ONCE(kvm->arch.dsm_id), host_virt_addr,
+		       length, write, unpin);
 
 	if (current->mm != kvm->mm)
 		return -EFAULT;
@@ -1011,6 +1200,21 @@ int kvm_dsm_mempin(struct kvm *kvm, unsigned long host_virt_addr,
 			gfn = __kvm_dsm_vfn_to_gfn(slot, false, vfn + i,
 						   NULL, NULL, NULL);
 			memslot = __gfn_to_memslot(__kvm_memslots(kvm, 0), gfn);
+			if (!memslot || memslot->id >= KVM_USER_MEM_SLOTS ||
+			    (memslot->flags & KVM_MEMSLOT_INVALID) ||
+			    gfn < memslot->base_gfn ||
+			    gfn >= memslot->base_gfn + memslot->npages) {
+				u32 node = gvm_dsm_log_node(kvm);
+
+				if (atomic_inc_return(&gvm_dsm_memcpy_bad_range_log_count[node]) <= 64)
+					printk(KERN_ERR "GVM DSM mempin: invalid rmap gfn node=%u hva=0x%lx len=%lu write=%u unpin=%u vfn=0x%llx gfn=0x%llx memslot=%px\n",
+					       READ_ONCE(kvm->arch.dsm_id),
+					       host_virt_addr, length, write, unpin,
+					       (unsigned long long)(vfn + i),
+					       (unsigned long long)gfn, memslot);
+				ret = -EFAULT;
+				goto out_unlock;
+			}
 			gfn_npages = min(npages - i, (unsigned long)(memslot->base_gfn +
 						memslot->npages - gfn));
 			for (j = 0; j < gfn_npages; j++) {

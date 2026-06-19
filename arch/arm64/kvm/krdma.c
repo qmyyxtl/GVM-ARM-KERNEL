@@ -1003,10 +1003,18 @@ static void build_krdma_send_output(const struct krdma_cb *cb,
  * |<----real data (sz=ret_val of send/recv)--->|<---2nd part of tx_add--->|
  */
 /* rdma transaction->krdma interfaces. */
-static size_t build_krdma_recv_output(struct krdma_cb *cb,
-		krdma_recv_trans_t *trans, char *buffer, tx_add_t *tx_add)
+static int build_krdma_recv_output(struct krdma_cb *cb,
+		krdma_recv_trans_t *trans, char *buffer, size_t buffer_len, tx_add_t *tx_add)
 {
 	size_t real_length = trans->length - (sizeof(tx_add_t) - sizeof(imm_t));
+
+	if (real_length > buffer_len) {
+		printk(KERN_ERR
+		       "%s: krdma payload length %zu exceeds caller buffer %zu\n",
+		       __func__, real_length, buffer_len);
+		trans->state = INVALID;
+		return -EMSGSIZE;
+	}
 
 	memcpy(tx_add, &trans->imm, sizeof(imm_t));
 	memcpy(((char *)tx_add) + sizeof(imm_t), trans->recv_buf + real_length,
@@ -1043,7 +1051,7 @@ static int krdma_post_recv(struct krdma_cb *cb)
  * acceptance all receiving requests.
  * wr_id means which slot is used for transmission.
  */
-int krdma_receive(struct krdma_cb *cb, char *buffer, unsigned long flag,
+int krdma_receive(struct krdma_cb *cb, char *buffer, size_t buffer_len, unsigned long flag,
 		tx_add_t *tx_add)
 {
 	int ret;
@@ -1066,7 +1074,7 @@ int krdma_receive(struct krdma_cb *cb, char *buffer, unsigned long flag,
 repoll:
 	/* Search in the buffer. */
 	if (search_recv_buf(cb, txid, &recv_trans, POLLED)) {
-		ret = build_krdma_recv_output(cb, recv_trans, buffer, tx_add);
+		ret = build_krdma_recv_output(cb, recv_trans, buffer, buffer_len, tx_add);
 		mutex_unlock(&cb->rlock);
 		// printk("%s: cb %p find 0x%x in buffer\n", __func__, cb, tx_add->txid);
 
@@ -1116,7 +1124,11 @@ repoll:
 	}
 	else {
 		/* My transaction ! */
-		build_krdma_recv_output(cb, recv_trans, buffer, tx_add);
+		ret = build_krdma_recv_output(cb, recv_trans, buffer, buffer_len, tx_add);
+		if (ret < 0) {
+			mutex_unlock(&cb->rlock);
+			return ret;
+		}
 		// printk("%s: cb %p find my tx 0x%x\n", __func__, cb, tx_add->txid);
 	}
 

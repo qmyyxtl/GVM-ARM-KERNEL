@@ -500,6 +500,17 @@ vm_fault_t kvm_arch_vcpu_fault(struct kvm_vcpu *vcpu, struct vm_fault *vmf)
 }
 
 
+
+void kvm_arch_mmu_notifier_release(struct kvm *kvm)
+{
+#ifdef CONFIG_KVM_DSM
+	if (kvm->arch.dsm_enabled)
+		printk(KERN_INFO "kvm-dsm: node-%u mmu notifier release stop\n",
+		       READ_ONCE(kvm->arch.dsm_id));
+	kvm_dsm_stop(kvm);
+#endif
+}
+
 /**
  * kvm_arch_destroy_vm - destroy the VM data structure
  * @kvm:	pointer to the KVM struct

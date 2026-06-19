@@ -54,11 +54,18 @@ extern bool kvm_dsm_dbg_verbose;
 #define dsm_debug_v(fmt, ...) do {					\
 		if (kvm_dsm_dbg_verbose) printk(KERN_DEBUG "%s(%s:%d): " fmt,	\
 		__func__, __FILE__, __LINE__, ##__VA_ARGS__); } while (0)
+#define dsm_trace_enabled()	(kvm_dsm_dbg_verbose)
+#define dsm_trace_info(fmt, ...) do {					\
+		if (kvm_dsm_dbg_verbose)					\
+			printk(KERN_INFO fmt, ##__VA_ARGS__);		\
+	} while (0)
 #else
 #define dsm_debug(fmt, ...) no_printk(KERN_DEBUG "%s(L%d): " fmt,		\
 		__func__, __LINE__, ##__VA_ARGS__)
 #define dsm_debug_v(fmt, ...) no_printk(KERN_DEBUG "%s: " fmt,		\
 		__func__, ##__VA_ARGS__)
+#define dsm_trace_enabled()	false
+#define dsm_trace_info(fmt, ...) no_printk(KERN_INFO fmt, ##__VA_ARGS__)
 #endif
 
 
@@ -66,7 +73,7 @@ extern bool kvm_dsm_dbg_verbose;
 struct kvm_network_ops {
 	int (*send)(kconnection_t *, const char *, size_t, unsigned long,
 			const tx_add_t*);
-	int (*receive)(kconnection_t *, char *, unsigned long, tx_add_t*);
+	int (*receive)(kconnection_t *, char *, size_t, unsigned long, tx_add_t*);
 	// int (*send)(kconnection_t *, const char *, size_t, unsigned long,
 			// const uint32_t);
 	// int (*receive)(kconnection_t *, char *, unsigned long, uint32_t*);
@@ -74,6 +81,7 @@ struct kvm_network_ops {
 	int (*listen)(const char *, const char *, kconnection_t **);
 	// int (*accept)(kconnection_t *, kconnection_t **, unsigned long);
 	int (*accept)(kconnection_t *, kconnection_t **, unsigned long);
+	int (*shutdown)(kconnection_t *);
 	int (*release)(kconnection_t *);
 };
 
@@ -108,15 +116,15 @@ extern void kvm_dsm_apply_access_right(struct kvm *kvm,
 		struct kvm_dsm_memory_slot *slot, hfn_t vfn,
 		unsigned long dsm_access, struct kvm_memory_slot *memslot);
 
-static inline uint16_t generate_txid(struct kvm *kvm, uint16_t dest_id)
+static inline uint32_t generate_txid(struct kvm *kvm, uint16_t dest_id)
 {
-	/* TODO: currently only 4 nodes are supported here. */
-	static atomic_t id[44] = { ATOMIC_INIT(0) };
+	static atomic_t id[DSM_MAX_INSTANCES * DSM_MAX_INSTANCES] = { ATOMIC_INIT(0) };
+	u32 idx = kvm->arch.dsm_id * DSM_MAX_INSTANCES + dest_id;
+	u32 r;
 
-	uint16_t r = 0;
 	do {
-		r =  (uint16_t)atomic_add_return(1, &id[kvm->arch.dsm_id * 10 + dest_id]);
-	} while (r == 0xFF);
+		r = (u32)atomic_inc_return(&id[idx]);
+	} while (!r || r == DSM_TXID_ANY);
 
 	return r;
 }
@@ -176,6 +184,23 @@ gfn_to_hvaslot(struct kvm *kvm, struct kvm_memory_slot *slot, gfn_t gfn)
 	return search_hvaslots(__kvm_hvaslots(kvm), __gfn_to_vfn_memslot(slot, gfn));
 }
 
+static inline bool kvm_dsm_hvaslot_matches_gfn(struct kvm_dsm_memory_slot *hvaslot,
+					       struct kvm_memory_slot *slot,
+					       gfn_t gfn)
+{
+	hfn_t vfn;
+
+	if (!hvaslot || !slot)
+		return false;
+
+	vfn = __gfn_to_vfn_memslot(slot, gfn);
+	if (vfn < hvaslot->base_vfn ||
+	    vfn >= hvaslot->base_vfn + hvaslot->npages)
+		return false;
+
+	return hvaslot->base_gfn + (vfn - hvaslot->base_vfn) == gfn;
+}
+
 static inline struct kvm_dsm_memory_slot *
 vfn_to_hvaslot(struct kvm *kvm, hfn_t vfn)
 {
@@ -186,7 +211,7 @@ int get_dsm_address(struct kvm *kvm, int dsm_id, struct dsm_address *addr);
 int dsm_create_memslot(struct kvm_dsm_memory_slot *slot,
 		unsigned long npages);
 int insert_hvaslot(struct kvm_dsm_memslots *slots, int pos, hfn_t start,
-		unsigned long npages);
+		gfn_t base_gfn, unsigned long npages);
 
 void dsm_lock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn,struct kvm_memory_slot *memslot);
 void dsm_unlock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn,struct kvm_memory_slot *memslot);
@@ -194,23 +219,61 @@ int dsm_trylock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn);
 int dsm_trylock_timeout(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn,
                int *retry_cnt,struct kvm_memory_slot *memslot);
 
+static inline bool dsm_vfn_valid(struct kvm_dsm_memory_slot *slot, hfn_t vfn,
+				 const char *where)
+{
+	if (likely(slot && slot->vfn_dsm_state &&
+		   vfn >= slot->base_vfn &&
+		   vfn < slot->base_vfn + slot->npages))
+		return true;
+
+	printk_ratelimited(KERN_ERR
+		"GVM DSM vfn bounds: where=%s slot=%px vfn=0x%llx base_vfn=0x%llx npages=%lu state=%px\n",
+		where, slot, (unsigned long long)vfn,
+		slot ? (unsigned long long)slot->base_vfn : 0,
+		slot ? slot->npages : 0,
+		slot ? slot->vfn_dsm_state : NULL);
+	return false;
+}
+
+static inline unsigned long dsm_vfn_index(struct kvm_dsm_memory_slot *slot,
+					  hfn_t vfn)
+{
+	return vfn - slot->base_vfn;
+}
+
 static inline bool dsm_is_pinned(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-	return atomic_read_acquire(&slot->vfn_dsm_state[vfn - slot->base_vfn].pinned_read) ||
-		atomic_read_acquire(&slot->vfn_dsm_state[vfn - slot->base_vfn].pinned_write);
+	unsigned long index;
+
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return false;
+
+	index = dsm_vfn_index(slot, vfn);
+	return atomic_read_acquire(&slot->vfn_dsm_state[index].pinned_read) ||
+		atomic_read_acquire(&slot->vfn_dsm_state[index].pinned_write);
 }
 
 static inline bool dsm_is_pinned_read(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-	return atomic_read_acquire(&slot->vfn_dsm_state[vfn - slot->base_vfn].pinned_read) &&
-		(atomic_read_acquire(&slot->vfn_dsm_state[vfn - slot->base_vfn].pinned_write) == 0);
+	unsigned long index;
+
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return false;
+
+	index = dsm_vfn_index(slot, vfn);
+	return atomic_read_acquire(&slot->vfn_dsm_state[index].pinned_read) &&
+		(atomic_read_acquire(&slot->vfn_dsm_state[index].pinned_write) == 0);
 }
 
 static inline void dsm_pin(struct kvm_dsm_memory_slot *slot, hfn_t vfn, bool write)
 {
 	unsigned long index;
 
-	index = vfn - slot->base_vfn;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	index = dsm_vfn_index(slot, vfn);
 	if (write) {
 		atomic_add(1, &slot->vfn_dsm_state[index].pinned_write);
 		WARN_ON(atomic_read(&slot->vfn_dsm_state[index].pinned_write) == 0);
@@ -224,7 +287,10 @@ static inline void dsm_unpin(struct kvm_dsm_memory_slot *slot, hfn_t vfn, bool w
 {
 	unsigned long index;
 
-	index = vfn - slot->base_vfn;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	index = dsm_vfn_index(slot, vfn);
 	if (write)
 		atomic_fetch_sub_release(1, &slot->vfn_dsm_state[index].pinned_write);
 	else
@@ -234,7 +300,10 @@ static inline void dsm_unpin(struct kvm_dsm_memory_slot *slot, hfn_t vfn, bool w
 #ifdef IVY_KVM_DSM
 static inline bool dsm_is_initial(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-	return (slot->vfn_dsm_state[vfn - slot->base_vfn].state &
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return false;
+
+	return (slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].state &
 			DSM_MSI_STATE_MASK) == DSM_INITIAL;
 }
 
@@ -242,41 +311,65 @@ static inline bool dsm_is_readable(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
 	unsigned long val;
 
-	val = slot->vfn_dsm_state[vfn - slot->base_vfn].state & DSM_MSI_STATE_MASK;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return false;
+
+	val = slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].state & DSM_MSI_STATE_MASK;
 	return (val == DSM_SHARED) || (val == DSM_MODIFIED);
 }
 
 static inline bool dsm_is_modified(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-	return (slot->vfn_dsm_state[vfn - slot->base_vfn].state &
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return false;
+
+	return (slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].state &
 			DSM_MSI_STATE_MASK) == DSM_MODIFIED;
 }
 
 static inline void dsm_change_state(struct kvm_dsm_memory_slot *slot, hfn_t vfn,
 		unsigned state)
 {
-	unsigned owner = slot->vfn_dsm_state[vfn - slot->base_vfn].state >> DSM_STATE_SHIFT;
-	slot->vfn_dsm_state[vfn - slot->base_vfn].state = (owner << DSM_STATE_SHIFT) | state;
+	unsigned long index;
+	unsigned owner;
+
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	index = dsm_vfn_index(slot, vfn);
+	owner = slot->vfn_dsm_state[index].state >> DSM_STATE_SHIFT;
+	slot->vfn_dsm_state[index].state = (owner << DSM_STATE_SHIFT) | state;
 }
 
 static inline int dsm_get_prob_owner(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-	return slot->vfn_dsm_state[vfn - slot->base_vfn].state >> DSM_STATE_SHIFT;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return 0;
+
+	return slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].state >> DSM_STATE_SHIFT;
 }
 
 static inline void dsm_set_prob_owner(struct kvm_dsm_memory_slot *slot,
 		hfn_t vfn, int owner)
 {
-	unsigned state = slot->vfn_dsm_state[vfn - slot->base_vfn].state &
-		DSM_STATE_MASK;
-	slot->vfn_dsm_state[vfn - slot->base_vfn].state =
-		(owner << DSM_STATE_SHIFT) | state;
+	unsigned long index;
+	unsigned state;
+
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	index = dsm_vfn_index(slot, vfn);
+	state = slot->vfn_dsm_state[index].state & DSM_STATE_MASK;
+	slot->vfn_dsm_state[index].state = (owner << DSM_STATE_SHIFT) | state;
 
 }
 
 static inline bool dsm_is_owner(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-	return slot->vfn_dsm_state[vfn - slot->base_vfn].state & DSM_OWNER;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return false;
+
+	return slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].state & DSM_OWNER;
 }
 
 #endif
@@ -284,7 +377,10 @@ static inline void dsm_set_twin(struct kvm_dsm_memory_slot *slot, hfn_t vfn,
 		char *twin)
 {
 #ifdef KVM_DSM_DIFF
-	slot->vfn_dsm_state[vfn - slot->base_vfn].diff.twin = twin;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].diff.twin = twin;
 #else
 	BUG();
 #endif
@@ -293,7 +389,10 @@ static inline void dsm_set_twin(struct kvm_dsm_memory_slot *slot, hfn_t vfn,
 static inline char *dsm_get_twin(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
 #ifdef KVM_DSM_DIFF
-	return slot->vfn_dsm_state[vfn - slot->base_vfn].diff.twin;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return NULL;
+
+	return slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].diff.twin;
 #else
 	BUG();
 #endif
@@ -303,7 +402,10 @@ static inline version_t dsm_get_version(struct kvm_dsm_memory_slot *slot,
 		hfn_t vfn)
 {
 #ifdef IVY_KVM_DSM
-	return slot->vfn_dsm_state[vfn - slot->base_vfn].version;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return 0;
+
+	return slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].version;
 #elif defined(TARDIS_KVM_DSM)
 	BUG();
 #endif
@@ -313,7 +415,10 @@ static inline version_t dsm_get_twin_version(struct kvm_dsm_memory_slot *slot,
 		hfn_t vfn)
 {
 #ifdef KVM_DSM_DIFF
-	return slot->vfn_dsm_state[vfn - slot->base_vfn].diff.version;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return 0;
+
+	return slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].diff.version;
 #else
 	BUG();
 #endif
@@ -323,7 +428,10 @@ static inline void dsm_incr_version(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
 	/* dsm_lock should be held. */
 #ifdef IVY_KVM_DSM
-	slot->vfn_dsm_state[vfn - slot->base_vfn].version++;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].version++;
 #elif defined(TARDIS_KVM_DSM)
 	BUG();
 #endif
@@ -333,7 +441,10 @@ static inline void dsm_incr_twin_version(struct kvm_dsm_memory_slot *slot, hfn_t
 {
 #ifdef KVM_DSM_DIFF
 	/* dsm_lock should be held. */
-	slot->vfn_dsm_state[vfn - slot->base_vfn].diff.version++;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].diff.version++;
 #else
 	BUG();
 #endif
@@ -344,7 +455,10 @@ static inline void dsm_set_version(struct kvm_dsm_memory_slot *slot, hfn_t vfn,
 {
 #ifdef IVY_KVM_DSM
 	/* dsm_lock should be held. */
-	slot->vfn_dsm_state[vfn - slot->base_vfn].version = version;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].version = version;
 #elif defined(TARDIS_KVM_DSM)
 	BUG();
 #endif
@@ -355,7 +469,10 @@ static inline void dsm_set_twin_version(struct kvm_dsm_memory_slot *slot, hfn_t 
 {
 #ifdef KVM_DSM_DIFF
 	/* dsm_lock should be held. */
-	slot->vfn_dsm_state[vfn - slot->base_vfn].diff.version = version;
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	slot->vfn_dsm_state[dsm_vfn_index(slot, vfn)].diff.version = version;
 #else
 	BUG();
 #endif
@@ -364,9 +481,9 @@ static inline void dsm_set_twin_version(struct kvm_dsm_memory_slot *slot, hfn_t 
 int dsm_encode_diff(struct kvm_dsm_memory_slot *slot, hfn_t vfn,
 		int msg_sender, char *page, struct kvm_memory_slot *memslot, gfn_t gfn,
 		uint16_t version);
-void dsm_decode_diff(char *page, int resp_len,
+void dsm_decode_diff(struct kvm *kvm, char *page, int resp_len,
 		struct kvm_memory_slot *memslot, gfn_t gfn);
-void dsm_set_twin_conditionally(struct kvm_dsm_memory_slot *slot,
+void dsm_set_twin_conditionally(struct kvm *kvm, struct kvm_dsm_memory_slot *slot,
 		hfn_t vfn, char *page, struct kvm_memory_slot *memslot, gfn_t gfn,
 		bool is_owner, version_t version);
 int kvm_dsm_connect(struct kvm *kvm, int dest_id, kconnection_t **conn_sock);
@@ -376,6 +493,10 @@ int kvm_read_guest_page_nonlocal(struct kvm *kvm,
 int kvm_write_guest_page_nonlocal(struct kvm *kvm,
 		struct kvm_memory_slot *slot, gfn_t gfn,
 		const void *data, int offset, int len);
+int kvm_dsm_read_guest_page(struct kvm *kvm, struct kvm_memory_slot *slot,
+		gfn_t gfn, void *data, int offset, int len);
+int kvm_dsm_write_guest_page(struct kvm *kvm, struct kvm_memory_slot *slot,
+		gfn_t gfn, const void *data, int offset, int len);
 
 /*
  * kvm_dsm_release_page must know whether a kvm_dsm_acquire_* is coped with fast
@@ -387,12 +508,18 @@ static inline void dsm_lock_fast_path(struct kvm_dsm_memory_slot *slot,
 		hfn_t vfn, bool is_server)
 {
 #ifdef IVY_KVM_DSM
-	mutex_lock(&slot->vfn_dsm_state[vfn - slot->base_vfn].fast_path_lock);
+	unsigned long index;
+
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	index = dsm_vfn_index(slot, vfn);
+	mutex_lock(&slot->vfn_dsm_state[index].fast_path_lock);
 	if (!is_server) {
 		/*
 		 * Only one vCPU can modify this value hence here is no data race.
 		 */
-		atomic_set_release(&slot->vfn_dsm_state[vfn - slot->base_vfn].fast_path_locked, true);
+		atomic_set_release(&slot->vfn_dsm_state[index].fast_path_locked, true);
 	}
 #endif
 }
@@ -401,13 +528,18 @@ static inline void dsm_unlock_fast_path(struct kvm_dsm_memory_slot *slot,
 		hfn_t vfn, bool is_server)
 {
 #ifdef IVY_KVM_DSM
-	if (!is_server && !atomic_read(&slot->vfn_dsm_state[vfn -
-			slot->base_vfn].fast_path_locked)) {
+	unsigned long index;
+
+	if (!dsm_vfn_valid(slot, vfn, __func__))
+		return;
+
+	index = dsm_vfn_index(slot, vfn);
+	if (!is_server && !atomic_read(&slot->vfn_dsm_state[index].fast_path_locked)) {
 		return;
 	}
-	mutex_unlock(&slot->vfn_dsm_state[vfn - slot->base_vfn].fast_path_lock);
+	mutex_unlock(&slot->vfn_dsm_state[index].fast_path_lock);
 	if (!is_server) {
-		atomic_set_release(&slot->vfn_dsm_state[vfn - slot->base_vfn].fast_path_locked, false);
+		atomic_set_release(&slot->vfn_dsm_state[index].fast_path_locked, false);
 	}
 #endif
 }
