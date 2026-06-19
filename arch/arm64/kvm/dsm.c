@@ -1170,6 +1170,8 @@ int kvm_dsm_mempin(struct kvm *kvm, unsigned long host_virt_addr,
 		return -EFAULT;
 	if (!kvm->arch.dsm_enabled)
 		return -EINVAL;
+	if (!length)
+		return 0;
 
 	dsm_debug_v("hva %lx, length %lu, write %d unpin %d\n", host_virt_addr, length, write, unpin);
 	idx = srcu_read_lock(&kvm->srcu);
