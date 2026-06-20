@@ -574,13 +574,12 @@ int kvm_dsm_write_guest_page(struct kvm *kvm, struct kvm_memory_slot *slot,
 		return -EINVAL;
 
 	/*
-	 * A vCPU fault handler runs in the QEMU mm and can use KVM's normal
-	 * userspace-memory helper.  Only DSM kthreads need access_remote_vm()
-	 * because they do not have the QEMU mm as current->mm.
+	 * DSM writes are protocol-owned page copies, not guest CPU stores.  Do not
+	 * route them through __kvm_write_guest_page(), as that helper marks the page
+	 * dirty and requires a running vCPU on dirty-ring configurations.  Mempin
+	 * requests originate from QEMU ioctls and DSM kthreads, so use the DSM copy
+	 * helper consistently for both current-mm and remote-mm callers.
 	 */
-	if (current->mm == kvm->mm)
-		return __kvm_write_guest_page(kvm, slot, gfn, data, offset, len);
-
 	return kvm_dsm_copy_guest_page_remote(kvm, slot, gfn, (void *)data,
 					      offset, len, true);
 }
