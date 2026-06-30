@@ -37,6 +37,190 @@ static uint64_t read_req_counter = 0;
 static atomic_t gvm_ivy_pf_log_count[DSM_MAX_INSTANCES];
 static atomic_t gvm_ivy_req_log_count[DSM_MAX_INSTANCES];
 
+#define GVM_DSM_HOT_NR		128
+#define GVM_DSM_LEASE_NS	2000000ULL
+#define GVM_DSM_LEASE_MIN_FLIPS	1024
+#define GVM_DSM_LEASE_MIN_WRITES 4096
+
+struct gvm_dsm_hot_entry {
+	bool valid;
+	u32 node;
+	gfn_t gfn;
+	u64 pf_read;
+	u64 pf_write;
+	u64 req_read;
+	u64 req_write;
+	u64 fetch_read;
+	u64 fetch_write;
+	u64 ack_read;
+	u64 ack_write;
+	u64 owner_flip;
+	u64 lease_delay;
+	u64 last_owner_change_ns;
+	u64 handle_ns;
+	u64 max_handle_ns;
+	int last_owner;
+};
+
+static DEFINE_SPINLOCK(gvm_dsm_hot_lock);
+static struct gvm_dsm_hot_entry gvm_dsm_hot[GVM_DSM_HOT_NR];
+
+enum gvm_dsm_hot_event {
+	GVM_DSM_HOT_PF_READ,
+	GVM_DSM_HOT_PF_WRITE,
+	GVM_DSM_HOT_REQ_READ,
+	GVM_DSM_HOT_REQ_WRITE,
+	GVM_DSM_HOT_FETCH_READ,
+	GVM_DSM_HOT_FETCH_WRITE,
+	GVM_DSM_HOT_ACK_READ,
+	GVM_DSM_HOT_ACK_WRITE,
+	GVM_DSM_HOT_OWNER_FLIP,
+};
+
+static u64 gvm_dsm_hot_score(const struct gvm_dsm_hot_entry *e)
+{
+	return e->pf_read + e->pf_write + e->req_read + e->req_write +
+	       e->fetch_read + e->fetch_write + e->ack_read + e->ack_write +
+	       e->owner_flip + e->lease_delay;
+}
+
+static void gvm_dsm_hot_note(struct kvm *kvm, gfn_t gfn,
+			     enum gvm_dsm_hot_event event,
+			     int owner_after, s64 handle_ns)
+{
+	struct gvm_dsm_hot_entry *e = NULL;
+	unsigned long flags;
+	u32 node = READ_ONCE(kvm->arch.dsm_id);
+	int i, victim = 0;
+	u64 victim_score = U64_MAX;
+
+	spin_lock_irqsave(&gvm_dsm_hot_lock, flags);
+	for (i = 0; i < GVM_DSM_HOT_NR; i++) {
+		if (gvm_dsm_hot[i].valid && gvm_dsm_hot[i].node == node &&
+		    gvm_dsm_hot[i].gfn == gfn) {
+			e = &gvm_dsm_hot[i];
+			break;
+		}
+		if (!gvm_dsm_hot[i].valid) {
+			victim = i;
+			victim_score = 0;
+			continue;
+		}
+		if (gvm_dsm_hot_score(&gvm_dsm_hot[i]) < victim_score) {
+			victim = i;
+			victim_score = gvm_dsm_hot_score(&gvm_dsm_hot[i]);
+		}
+	}
+
+	if (!e) {
+		e = &gvm_dsm_hot[victim];
+		memset(e, 0, sizeof(*e));
+		e->valid = true;
+		e->node = node;
+		e->gfn = gfn;
+		e->last_owner = -1;
+	}
+
+	switch (event) {
+	case GVM_DSM_HOT_PF_READ:
+		e->pf_read++;
+		break;
+	case GVM_DSM_HOT_PF_WRITE:
+		e->pf_write++;
+		break;
+	case GVM_DSM_HOT_REQ_READ:
+		e->req_read++;
+		break;
+	case GVM_DSM_HOT_REQ_WRITE:
+		e->req_write++;
+		break;
+	case GVM_DSM_HOT_FETCH_READ:
+		e->fetch_read++;
+		break;
+	case GVM_DSM_HOT_FETCH_WRITE:
+		e->fetch_write++;
+		break;
+	case GVM_DSM_HOT_ACK_READ:
+		e->ack_read++;
+		break;
+	case GVM_DSM_HOT_ACK_WRITE:
+		e->ack_write++;
+		break;
+	case GVM_DSM_HOT_OWNER_FLIP:
+		e->owner_flip++;
+		break;
+	}
+
+	if (handle_ns > 0) {
+		e->handle_ns += handle_ns;
+		if ((u64)handle_ns > e->max_handle_ns)
+			e->max_handle_ns = handle_ns;
+	}
+	if (owner_after >= 0) {
+		if (e->last_owner >= 0 && e->last_owner != owner_after) {
+			e->owner_flip++;
+			e->last_owner_change_ns = ktime_get_ns();
+		} else if (e->last_owner < 0) {
+			e->last_owner_change_ns = ktime_get_ns();
+		}
+		e->last_owner = owner_after;
+	}
+	spin_unlock_irqrestore(&gvm_dsm_hot_lock, flags);
+}
+
+static bool gvm_dsm_should_delay_owner_xfer(struct kvm *kvm, gfn_t gfn,
+					    u64 *delay_ns)
+{
+	unsigned long flags;
+	u32 node = READ_ONCE(kvm->arch.dsm_id);
+	u64 now = ktime_get_ns();
+	bool delay = false;
+	int i;
+
+	*delay_ns = 0;
+
+	spin_lock_irqsave(&gvm_dsm_hot_lock, flags);
+	for (i = 0; i < GVM_DSM_HOT_NR; i++) {
+		struct gvm_dsm_hot_entry *e = &gvm_dsm_hot[i];
+		u64 writes, age;
+
+		if (!e->valid || e->node != node || e->gfn != gfn)
+			continue;
+
+		writes = e->pf_write + e->req_write + e->fetch_write;
+		if (e->owner_flip < GVM_DSM_LEASE_MIN_FLIPS ||
+		    writes < GVM_DSM_LEASE_MIN_WRITES ||
+		    e->last_owner != node ||
+		    !e->last_owner_change_ns)
+			break;
+
+		age = now - e->last_owner_change_ns;
+		if (age < GVM_DSM_LEASE_NS) {
+			*delay_ns = GVM_DSM_LEASE_NS - age;
+			e->lease_delay++;
+			delay = true;
+		}
+		break;
+	}
+	spin_unlock_irqrestore(&gvm_dsm_hot_lock, flags);
+
+	return delay;
+}
+
+static void gvm_dsm_retry_backoff(u64 delay_ns)
+{
+	if (!delay_ns) {
+		cond_resched();
+		return;
+	}
+
+	if (delay_ns < 50000)
+		udelay((unsigned long)DIV_ROUND_UP_ULL(delay_ns, 1000));
+	else
+		usleep_range((unsigned long)DIV_ROUND_UP_ULL(delay_ns, 1000),
+			     (unsigned long)DIV_ROUND_UP_ULL(delay_ns, 1000) + 50);
+}
+
 static inline bool dsm_current_should_stop(void)
 {
 	return (current->flags & PF_KTHREAD) && kthread_should_stop();
@@ -354,7 +538,7 @@ static int dsm_handle_invalidate_req(struct kvm *kvm, kconnection_t *conn_sock,
 static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 		struct kvm_memory_slot *memslot, struct kvm_dsm_memory_slot *slot,
 		const struct dsm_request *req, bool *retry, hfn_t vfn, char *page,
-		tx_add_t *tx_add)
+		tx_add_t *tx_add, u64 *retry_delay_ns)
 {
 	int ret = 0, length = 0;
 	int owner = -1;
@@ -374,7 +558,17 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 
 		/* I'm owner */
 		int old_owner = dsm_get_prob_owner(slot, vfn);
+		u64 delay_ns;
+
+		if (gvm_dsm_should_delay_owner_xfer(kvm, req->gfn, &delay_ns)) {
+			*retry = true;
+			*retry_delay_ns = delay_ns;
+			return 0;
+		}
+
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
+		gvm_dsm_hot_note(kvm, req->gfn, GVM_DSM_HOT_OWNER_FLIP,
+				 req->msg_sender, 0);
 		dsm_debug_v("kvm[%d](M1) changed owner of gfn[%llu,%d] "
 				"from kvm[%d] to kvm[%d]\n", kvm->arch.dsm_id, req->gfn,
 				req->is_smm, old_owner, req->msg_sender);
@@ -417,6 +611,8 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 		};
 		owner = dsm_get_prob_owner(slot, vfn);
 		if (owner == req->msg_sender || owner == req->requester) {
+			gvm_dsm_hot_note(kvm, req->gfn, GVM_DSM_HOT_ACK_WRITE,
+					 req->msg_sender, 0);
 			printk_ratelimited(KERN_WARNING
 			       "GVM DSM write_req: stale owner hint node=%u gfn=0x%llx owner=%d requester=%u sender=%u state=0x%x version=%u, ack-only\n",
 			       READ_ONCE(kvm->arch.dsm_id),
@@ -433,6 +629,8 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 			goto send_write_resp;
 		}
 		ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, &resp);
+		gvm_dsm_hot_note(kvm, req->gfn, GVM_DSM_HOT_FETCH_WRITE,
+				 req->msg_sender, 0);
 		if (ret < 0)
 			return ret;
 
@@ -561,6 +759,8 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 		};
 		owner = dsm_get_prob_owner(slot, vfn);
 		if (owner == req->msg_sender || owner == req->requester) {
+			gvm_dsm_hot_note(kvm, req->gfn, GVM_DSM_HOT_ACK_READ,
+					 req->msg_sender, 0);
 			printk_ratelimited(KERN_WARNING
 			       "GVM DSM read_req: stale owner hint node=%u gfn=0x%llx owner=%d requester=%u sender=%u state=0x%x version=%u, ack-only\n",
 			       READ_ONCE(kvm->arch.dsm_id),
@@ -577,6 +777,8 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 			goto send_read_resp;
 		}
 		ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, &resp);
+		gvm_dsm_hot_note(kvm, req->gfn, GVM_DSM_HOT_FETCH_READ,
+				 req->msg_sender, 0);
 		if (ret < 0)
 			goto out;
 		BUG_ON(dsm_is_readable(slot, vfn) && !(test_bit(kvm->arch.dsm_id,
@@ -626,6 +828,7 @@ int ivy_kvm_dsm_handle_req(void *data)
 	struct dsm_request req;
 	bool retry = false;
 	bool locked = false;
+	u64 retry_delay_ns = 0;
 	int lock_retry_cnt = 0;
 	hfn_t vfn;
 	char comm[TASK_COMM_LEN];
@@ -675,6 +878,7 @@ int ivy_kvm_dsm_handle_req(void *data)
 		lock_retry_cnt = 0;
 
 retry_handle_req:
+		retry_delay_ns = 0;
 		idx = srcu_read_lock(&kvm->srcu);
 		memslot = __gfn_to_memslot(__kvm_memslots(kvm, req.is_smm), req.gfn);
 		/*
@@ -726,6 +930,13 @@ retry_handle_req:
 			       dsm_get_prob_owner(slot, vfn),
 			       dsm_get_version(slot, vfn), tx_add.txid);
 
+		if (req.req_type == DSM_REQ_READ)
+			gvm_dsm_hot_note(kvm, req.gfn, GVM_DSM_HOT_REQ_READ,
+					 dsm_get_prob_owner(slot, vfn), 0);
+		else if (req.req_type == DSM_REQ_WRITE)
+			gvm_dsm_hot_note(kvm, req.gfn, GVM_DSM_HOT_REQ_WRITE,
+					 dsm_get_prob_owner(slot, vfn), 0);
+
 		dsm_debug_v("kvm[%d] received request[0x%x] from kvm[%d->%d] req_type[%s] "
 				"gfn[%llu,%d] vfn[%llu] version %d myversion %d\n",
 				kvm->arch.dsm_id, tx_add.txid, req.msg_sender, req.requester,
@@ -774,7 +985,7 @@ retry_handle_req:
 		case DSM_REQ_WRITE:
 			// printk("write req");
 			ret = dsm_handle_write_req(kvm, conn_sock, memslot, slot, &req,
-					&retry, vfn, page, &tx_add);
+					&retry, vfn, page, &tx_add, &retry_delay_ns);
 			if (ret < 0)
 				goto out_unlock;
 			break;
@@ -812,7 +1023,7 @@ retry_handle_req:
 
 		if (retry) {
 			retry = false;
-			schedule();
+			gvm_dsm_retry_backoff(retry_delay_ns);
 			goto retry_handle_req;
 		}
 	}
@@ -1036,6 +1247,8 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			fetch_end = ktime_get();
 			fetch_time = ktime_to_ns(ktime_sub(fetch_end, fetch_start));
 			total_time+=fetch_time;
+			gvm_dsm_hot_note(kvm, gfn, GVM_DSM_HOT_FETCH_WRITE,
+					 owner, 0);
 			dsmpf_debug("w_fet %llu cost %lld \n",write_req_counter,fetch_time);
 			if (ret < 0){
 				dsm_debug_v("kvm fetch error");
@@ -1109,6 +1322,8 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		fetch_end = ktime_get();
 		fetch_time = ktime_to_ns(ktime_sub(fetch_end, fetch_start));
 		total_time+=fetch_time;
+		gvm_dsm_hot_note(kvm, gfn, GVM_DSM_HOT_FETCH_READ,
+				 owner, 0);
 		dsmpf_debug("r_fet %llu cost %lld \n",read_req_counter,fetch_time);
 		if (ret < 0){
 			dsm_debug_v("kvm fetch error");
@@ -1151,6 +1366,9 @@ out:
 
 	dsmpf_debug("handle cost: %lld \n",handle_time);
 	dsmpf_debug("avg cost: %lld \n",total_time/dsm_page_fault_counter);
+	gvm_dsm_hot_note(kvm, gfn, write ? GVM_DSM_HOT_PF_WRITE :
+			 GVM_DSM_HOT_PF_READ, dsm_get_prob_owner(slot, vfn),
+			 handle_time);
 	if (dsm_trace_enabled() &&
 	    atomic_inc_return(&gvm_ivy_pf_log_count[log_node]) <= 256)
 		printk(KERN_INFO "GVM DSM ivy_pf: node=%u gfn=0x%llx vfn=0x%llx write=%d fast=0 state=0x%x owner=%d resp_len=%d ret=0x%x handle_ns=%lld\n",
