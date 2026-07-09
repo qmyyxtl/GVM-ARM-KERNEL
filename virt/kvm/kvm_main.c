@@ -1620,6 +1620,7 @@ static int check_memory_region_flags(const struct kvm_userspace_memory_region *m
 #ifdef __KVM_HAVE_READONLY_MEM
 	valid_flags |= KVM_MEM_READONLY;
 #endif
+	valid_flags |= KVM_MEM_UNCACHED;
 	valid_flags |= KVM_MEM_HUGE_POD;
 
 	if (mem->flags & ~valid_flags)
@@ -2085,7 +2086,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
 	} else { /* Modify an existing slot. */
 		if ((mem->userspace_addr != old->userspace_addr) ||
 		    (npages != old->npages) ||
-		    ((mem->flags ^ old->flags) & KVM_MEM_READONLY))
+		    ((mem->flags ^ old->flags) & (KVM_MEM_READONLY | KVM_MEM_UNCACHED)))
 			return -EINVAL;
 
 		if (base_gfn != old->base_gfn)

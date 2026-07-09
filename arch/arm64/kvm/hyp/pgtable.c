@@ -698,8 +698,20 @@ static int stage2_set_prot_attr(struct kvm_pgtable *pgt, enum kvm_pgtable_prot p
 				kvm_pte_t *ptep)
 {
 	bool device = prot & KVM_PGTABLE_PROT_DEVICE;
-	kvm_pte_t attr = device ? KVM_S2_MEMATTR(pgt, DEVICE_nGnRE) :
-			    KVM_S2_MEMATTR(pgt, NORMAL);
+	bool normal_nc = prot & KVM_PGTABLE_PROT_NORMAL_NC;
+	kvm_pte_t attr;
+
+	if (device && normal_nc)
+		return -EINVAL;
+	if (normal_nc && stage2_has_fwb(pgt))
+		return -EINVAL;
+
+	if (device)
+		attr = KVM_S2_MEMATTR(pgt, DEVICE_nGnRE);
+	else if (normal_nc)
+		attr = PTE_S2_MEMATTR(MT_S2_NORMAL_NC);
+	else
+		attr = KVM_S2_MEMATTR(pgt, NORMAL);
 	u32 sh = KVM_PTE_LEAF_ATTR_LO_S2_SH_IS;
 
 	if (!(prot & KVM_PGTABLE_PROT_X))
