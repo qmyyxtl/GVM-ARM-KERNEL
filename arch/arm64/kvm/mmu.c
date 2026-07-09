@@ -1716,7 +1716,13 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 		goto out_dsm_release;
 	}
 
-	if (kvm_is_device_pfn(pfn)) {
+	if (memslot->flags & KVM_MEM_UNCACHED) {
+		/*
+		 * Experimental userspace opt-in: map this RAM memslot with
+		 * stage-2 device attributes so guest accesses are uncached.
+		 */
+		device = true;
+	} else if (kvm_is_device_pfn(pfn)) {
 		/*
 		 * If the page was identified as device early by looking at
 		 * the VMA flags, vma_pagesize is already representing the
