@@ -50,11 +50,6 @@
  *                 kvm_dsm_memslot_is_coherent_ram(memslot);
  *
  *         if (dsm_active) {
- *                 force_pte = true;
- *                 vma_shift = PAGE_SHIFT;
- *         }
- *
- *         if (dsm_active) {
  *                 dsm_access = kvm_dsm_vcpu_acquire_page(vcpu, &memslot,
  *                                                        gfn, write_fault);
  *                 if (dsm_access < 0)
@@ -71,9 +66,9 @@
  *         if (dsm_acquired)
  *                 kvm_dsm_vcpu_release_page(vcpu, memslot, gfn);
  *
- * The important detail is dsm_active, not dsm_enabled: an uncached slot must
- * not inherit DSM's force-4K policy, otherwise it loses the normal hugepage
- * mapping path even though it bypasses acquire/release.
+ * The important detail is dsm_active, not dsm_enabled.  Page size selection
+ * remains the DSM tree's existing policy: the bypass must not introduce a
+ * new force-4K rule for either normal DSM RAM or uncached RAM.
  */
 
 /*
