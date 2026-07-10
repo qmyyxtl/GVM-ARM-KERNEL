@@ -1406,6 +1406,14 @@ static u64 __kvm_read_sanitised_id_reg(const struct kvm_vcpu *vcpu,
 	val = read_sanitised_ftr_reg(id);
 
 	switch (id) {
+	case SYS_ID_AA64MMFR1_EL1:
+		/*
+		 * Do not expose hardware Access Flag/Dirty Bit management to guests.
+		 * A guest page-table update can otherwise fault when its PTE resides
+		 * in a stage-2 Normal-NC memslot.
+		 */
+		val &= ~ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_HAFDBS);
+		break;
 	case SYS_ID_AA64PFR1_EL1:
 		if (!kvm_has_mte(vcpu->kvm))
 			val &= ~ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_MTE);
