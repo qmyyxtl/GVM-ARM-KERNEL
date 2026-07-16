@@ -17,6 +17,7 @@
 #include <linux/kvm_host.h>
 #include <linux/kvm.h>
 #include "dsm.h"
+#include "ivy.h"
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_pgtable.h>
 
@@ -913,6 +914,8 @@ void kvm_dsm_stop(struct kvm *kvm)
 
 	if (!kvm->arch.dsm_enabled)
 		return;
+
+	ivy_kvm_dsm_dump_stats(kvm);
 
 	WRITE_ONCE(kvm->arch.dsm_stopped, true);
 	smp_mb();
